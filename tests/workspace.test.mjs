@@ -18,7 +18,7 @@ describe("client workspace navigation", () => {
 
   it("routes manager alerts to the matching workspace page", () => {
     assert.equal(getWorkspaceTabForAlert("documents_received"), "review");
-    assert.equal(getWorkspaceTabForAlert("job_completed"), "review");
+    assert.equal(getWorkspaceTabForAlert("sent_for_review"), "review");
     assert.equal(getWorkspaceTabForAlert("need_more_info"), "timeline");
     assert.equal(getWorkspaceTabForAlert("data_issue"), "timeline");
     assert.equal(getWorkspaceTabForAlert("manager_alert"), "profile");

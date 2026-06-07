@@ -393,26 +393,29 @@ tr.clickable:hover {
 }
 
 .status-pill.in_progress,
+.status-pill.revision_in_progress,
 .status-pill.job_assigned,
 .status-pill.job_accepted {
   background: #fff2d7;
   color: var(--warn);
 }
 
-.status-pill.job_completed,
+.status-pill.sent_for_review,
+.status-pill.resubmitted,
 .status-pill.reviewed_billed,
 .status-pill.payment_received {
   background: #e8f4ec;
   color: var(--ok);
 }
 
-.status-pill.final_package_approved {
+.status-pill.under_review,
+.status-pill.approved {
   background: #e7f0ff;
   color: #245c9a;
 }
 
 .status-pill.need_more_info,
-.status-pill.revision_requested {
+.status-pill.revision_required {
   background: #fde9e5;
   color: var(--brand-2);
 }

@@ -28,6 +28,9 @@ export function filterAlertsByType(alerts, filter) {
   if (!filter || filter === "all") {
     return alerts;
   }
+  if (filter === "sent_for_review") {
+    return alerts.filter((alert) => ["sent_for_review", "resubmitted"].includes(alert.type));
+  }
   return alerts.filter((alert) => alert.type === filter);
 }
 
@@ -37,10 +40,10 @@ export function filterJobsByEmployeeStatus(jobs, filter) {
   }
   const statusGroups = {
     new_assigned: ["job_assigned"],
-    in_progress: ["job_accepted", "in_progress"],
-    revision_requested: ["revision_requested"],
-    waiting_manager_review: ["job_completed"],
-    closed_or_sent: ["final_package_approved", "reviewed_billed", "payment_received"],
+    in_progress: ["job_accepted", "in_progress", "revision_in_progress"],
+    revision_required: ["revision_required"],
+    waiting_manager_review: ["sent_for_review", "resubmitted"],
+    closed_or_sent: ["approved", "reviewed_billed", "payment_received"],
   };
   const statuses = statusGroups[filter] ?? [];
   return jobs.filter((job) => statuses.includes(job.status));

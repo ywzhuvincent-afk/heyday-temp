@@ -15,12 +15,14 @@
   getVisibleJobsForUser,
   markPaymentReceived,
   needMoreInfo,
+  normalizeWorkflowState,
   receiveUploadedDocuments,
   requestDocuments,
   reassignJob,
   reviewAndBill,
   returnToEmployee,
   searchClients,
+  startManagerReview,
   startRevision,
   startJob,
   undoAssignment,
@@ -304,7 +306,7 @@ function renderManager() {
             <div class="section-header">
               <div>
                 <div class="section-title">Documents To Review</div>
-                <div class="section-subtitle">Client uploads and completed employee work waiting for manager review</div>
+                <div class="section-subtitle">Client uploads and submitted employee work waiting for manager review</div>
               </div>
               <span class="status-pill documents_received">${filteredReviewInbox.length}/${reviewInbox.length} waiting</span>
             </div>
@@ -320,7 +322,7 @@ function renderManager() {
             <div class="section-header">
               <div>
                 <div class="section-title">Manager Alerts</div>
-                <div class="section-subtitle">Uploaded documents, completed jobs, and information requests</div>
+                <div class="section-subtitle">Uploaded documents, work sent for review, and information requests</div>
               </div>
             </div>
             <div class="detail-body">
@@ -530,7 +532,7 @@ function employeeJobFilterOptions(jobs) {
     ["all", "All Jobs"],
     ["new_assigned", "New Assigned"],
     ["in_progress", "In Progress"],
-    ["revision_requested", "Revision Requested"],
+    ["revision_required", "Revision Required"],
     ["waiting_manager_review", "Waiting Manager Review"],
     ["closed_or_sent", "Closed or Sent"],
   ];
@@ -551,7 +553,7 @@ function renderReviewInboxControls(items) {
         <select id="review-inbox-filter">
           <option value="all" ${reviewInboxFilter === "all" ? "selected" : ""}>All Reviews (${items.length})</option>
           <option value="client_documents" ${reviewInboxFilter === "client_documents" ? "selected" : ""}>Client Documents (${items.filter((item) => item.reviewType === "client_documents").length})</option>
-          <option value="completed_work" ${reviewInboxFilter === "completed_work" ? "selected" : ""}>Completed Work (${items.filter((item) => item.reviewType === "completed_work").length})</option>
+          <option value="completed_work" ${reviewInboxFilter === "completed_work" ? "selected" : ""}>Work Review (${items.filter((item) => item.reviewType === "completed_work").length})</option>
         </select>
       </label>
     </div>
@@ -560,7 +562,7 @@ function renderReviewInboxControls(items) {
 
 function renderReviewInbox(items) {
   if (!items.length) {
-    return `<div class="empty-state">No documents or completed work are waiting for review.</div>`;
+    return `<div class="empty-state">No documents or submitted work are waiting for review.</div>`;
   }
 
   return items
@@ -569,10 +571,10 @@ function renderReviewInbox(items) {
         <article class="review-item">
           <div>
             <div class="job-title">${escapeHtml(item.client.name)}</div>
-            <div class="filter-chip">${item.reviewType === "completed_work" ? "Completed Work" : "Client Documents"}</div>
+            <div class="filter-chip">${item.reviewType === "completed_work" ? `${formatReviewRound(item.reviewRound)} Review` : "Client Documents"}</div>
             <div class="muted small">${escapeHtml(item.client.contactName)} · ${item.fileCount} file(s) uploaded</div>
             ${item.reviewType === "completed_work" && item.job?.assignedTo ? `<div class="muted small">Employee: ${escapeHtml(state.users[item.job.assignedTo]?.name ?? "Unassigned")}</div>` : ""}
-            <div class="muted small">${item.reviewType === "completed_work" ? "Completed" : "Uploaded"} ${formatDateTime(item.uploadedAt)}</div>
+            <div class="muted small">${item.reviewType === "completed_work" ? "Sent" : "Uploaded"} ${formatDateTime(item.uploadedAt)}</div>
           </div>
           <div class="review-actions">
             ${statusPill(item.status)}
@@ -592,7 +594,7 @@ function renderManagerAlertControls(alerts) {
         <select id="manager-alert-filter">
           <option value="all" ${managerAlertFilter === "all" ? "selected" : ""}>All Alerts (${alerts.length})</option>
           <option value="documents_received" ${managerAlertFilter === "documents_received" ? "selected" : ""}>Uploaded Documents (${alerts.filter((alert) => alert.type === "documents_received").length})</option>
-          <option value="job_completed" ${managerAlertFilter === "job_completed" ? "selected" : ""}>Job Completed (${alerts.filter((alert) => alert.type === "job_completed").length})</option>
+          <option value="sent_for_review" ${managerAlertFilter === "sent_for_review" ? "selected" : ""}>Sent for Review (${alerts.filter((alert) => ["sent_for_review", "resubmitted"].includes(alert.type)).length})</option>
           <option value="need_more_info" ${managerAlertFilter === "need_more_info" ? "selected" : ""}>Need More Info (${alerts.filter((alert) => alert.type === "need_more_info").length})</option>
           <option value="data_issue" ${managerAlertFilter === "data_issue" ? "selected" : ""}>Data Issue (${alerts.filter((alert) => alert.type === "data_issue").length})</option>
         </select>
@@ -741,8 +743,8 @@ function clientRowAction(client, job) {
   if (client.status === "documents_received") {
     return `<button class="primary-button compact-button" data-action="review-documents" data-id="${client.id}">Review Documents</button>`;
   }
-  if (client.status === "job_completed") {
-    return `<button class="primary-button compact-button" data-action="review-documents" data-id="${client.id}">Review Documents</button>`;
+  if (["sent_for_review", "resubmitted"].includes(client.status)) {
+    return `<button class="primary-button compact-button" data-action="review-documents" data-id="${client.id}">Start Review</button>`;
   }
   if (client.status === "need_more_info") {
     return `<button class="ghost-button compact-button" data-action="alert-open" data-id="${client.id}" data-type="need_more_info">Review Status</button>`;
@@ -940,34 +942,35 @@ function renderWorkspaceFiles(files) {
 }
 
 function renderWorkspaceReview(client, job, uploadedFiles, latestUpload, employeeWorkFiles, latestEmployeeWork) {
-  if (job?.status === "job_completed") {
+  if (job?.status === "under_review") {
     const assignedEmployee = job.assignedTo ? state.users[job.assignedTo] : null;
     return `
       <section class="workspace-page">
-        <div class="workspace-page-title">Manager Final Review</div>
+        <div class="workspace-page-title">Under Review</div>
         <div class="review-summary">
-          ${info("Completed Files", `${employeeWorkFiles.length} file(s)`)}
-          ${info("Completed Time", latestEmployeeWork ? formatDateTime(latestEmployeeWork) : "No completion recorded")}
+          ${info("Review Round", `${formatReviewRound(job.reviewRound)} Review`)}
+          ${info("Work Files", `${employeeWorkFiles.length} file(s)`)}
+          ${info("Submitted Time", latestEmployeeWork ? formatDateTime(latestEmployeeWork) : "No submission recorded")}
           ${info("Employee", assignedEmployee?.name ?? "Unassigned")}
-          ${info("Next Step", "Approve final package or return to employee")}
+          ${info("Next Step", "Approve or return to employee")}
         </div>
         <div class="file-list">
-          ${renderFileList(employeeWorkFiles, "No employee completed files found.")}
+          ${renderFileList(employeeWorkFiles, "No employee work files found.")}
         </div>
         ${renderFilePreviewPanel()}
         <div class="button-row">
-          <button class="primary-button" data-action="approve-final-package" data-id="${job.id}" ${lockedAttr("approve-final-package", job.id)}>${actionLabel("approve-final-package", job.id, "Approve Final Package", "Processing...")}</button>
-          <button class="ghost-button" data-action="request-revision" data-id="${job.id}">Return To Employee</button>
+          <button class="primary-button" data-action="approve-final-package" data-id="${job.id}" ${lockedAttr("approve-final-package", job.id)}>${actionLabel("approve-final-package", job.id, "Approve", "Processing...")}</button>
+          <button class="ghost-button" data-action="request-revision" data-id="${job.id}">Require Revision</button>
           <button class="ghost-button" data-action="workspace-tab" data-id="files">View All Files</button>
         </div>
         ${
           pendingReturnJobId === job.id
             ? `
               <div class="confirm-panel">
-                <div class="job-title">Return To Employee For Revision</div>
+                <div class="job-title">Revision Required</div>
                 <label class="field">
                   <span>Revision Instructions</span>
-                  <textarea id="revision-note" placeholder="Tell the employee exactly what to fix.">Please revise the completed package before final delivery.</textarea>
+                  <textarea id="revision-note" placeholder="Tell the employee exactly what to fix.">Please revise the package before final delivery.</textarea>
                 </label>
                 <div class="button-row">
                   <button class="primary-button" data-action="send-revision" data-id="${job.id}" ${lockedAttr("send-revision", job.id)}>${actionLabel("send-revision", job.id, "Send Revision Request", "Sending...")}</button>
@@ -981,11 +984,11 @@ function renderWorkspaceReview(client, job, uploadedFiles, latestUpload, employe
     `;
   }
 
-  if (job?.status === "final_package_approved") {
+  if (job?.status === "approved") {
     return `
       <section class="workspace-page">
-        <div class="workspace-page-title">Final Review Approved</div>
-        <div class="empty-state">Final package is approved. Open Final Package to send the files and invoice to the client.</div>
+        <div class="workspace-page-title">Approved</div>
+        <div class="empty-state">The work is approved. Open Final Package to send the files and invoice to the client.</div>
         <div class="button-row">
           <button class="primary-button" data-action="workspace-tab" data-id="final">Open Final Package</button>
           <button class="ghost-button" data-action="workspace-tab" data-id="timeline">Open Timeline</button>
@@ -1168,7 +1171,7 @@ function renderWorkspaceTimeline(events) {
 }
 
 function renderWorkspaceFinalPackage(client, job, finalFiles, billing, billingFiles) {
-  const canSend = job && job.status === "final_package_approved" && !billing;
+  const canSend = job && job.status === "approved" && !billing;
   const sent = Boolean(billing);
   const attachmentCount = finalFiles.length + billingFiles.length;
 
@@ -1177,7 +1180,7 @@ function renderWorkspaceFinalPackage(client, job, finalFiles, billing, billingFi
       <div class="workspace-page-title">Final Package</div>
       <div class="review-summary">
         ${info("Recipient", client.email)}
-        ${info("Package Status", sent ? "Sent to client with invoice" : job?.status === "final_package_approved" ? "Approved, ready to send" : "Waiting for final review approval")}
+        ${info("Package Status", sent ? "Sent to client with invoice" : job?.status === "approved" ? "Approved, ready to send" : "Waiting for approval")}
         ${info("Attachments", `${attachmentCount || finalFiles.length} file(s)`)}
         ${info("Invoice", billing ? `${billing.invoiceNumber} - $${billing.amount} CAD` : "Not sent yet")}
       </div>
@@ -1435,12 +1438,12 @@ function renderEmployeeJobGroups(jobs) {
 
   const groups = [
     ["New Assigned", jobs.filter((job) => job.status === "job_assigned")],
-    ["Revision Requested", jobs.filter((job) => job.status === "revision_requested")],
-    ["In Progress", jobs.filter((job) => ["job_accepted", "in_progress"].includes(job.status))],
-    ["Completed Waiting Manager Review", jobs.filter((job) => job.status === "job_completed")],
+    ["Revision Required", jobs.filter((job) => job.status === "revision_required")],
+    ["In Progress", jobs.filter((job) => ["job_accepted", "in_progress", "revision_in_progress"].includes(job.status))],
+    ["Sent for Review", jobs.filter((job) => ["sent_for_review", "resubmitted", "under_review"].includes(job.status))],
     [
       "Closed or Sent",
-      jobs.filter((job) => ["final_package_approved", "reviewed_billed", "payment_received"].includes(job.status)),
+      jobs.filter((job) => ["approved", "reviewed_billed", "payment_received"].includes(job.status)),
     ],
   ].filter(([, groupJobs]) => groupJobs.length);
 
@@ -1461,13 +1464,14 @@ function renderEmployeeJobGroups(jobs) {
 function renderEmployeeJob(job) {
   const canAccept = job.status === "job_assigned";
   const canStart = ["job_accepted"].includes(job.status);
-  const canStartRevision = job.status === "revision_requested";
-  const canUploadWorkFiles = job.status === "in_progress";
+  const canStartRevision = job.status === "revision_required";
+  const canUploadWorkFiles = ["in_progress", "revision_in_progress"].includes(job.status);
   const employeeWorkFiles = state.files.filter((file) => file.jobId === job.id && file.section === "employee_work");
   const hasWorkFiles = employeeWorkFiles.length > 0;
-  const canSubmitReview = job.status === "in_progress" && hasWorkFiles;
-  const waitingManagerReview = job.status === "job_completed";
-  const closed = ["final_package_approved", "reviewed_billed", "payment_received"].includes(job.status);
+  const canSubmitReview = ["in_progress", "revision_in_progress"].includes(job.status) && hasWorkFiles;
+  const waitingManagerReview = ["sent_for_review", "resubmitted", "under_review"].includes(job.status);
+  const closed = ["approved", "reviewed_billed", "payment_received"].includes(job.status);
+  const submitLabel = job.status === "revision_in_progress" ? "Resubmit" : "Send for Review";
 
   return `
     <article class="job-card">
@@ -1485,7 +1489,8 @@ function renderEmployeeJob(job) {
         ${info("Started", job.startedAt ? formatDateTime(job.startedAt) : "Not started")}
         ${job.revisionNote ? info("Revision Notes", job.revisionNote) : ""}
         ${info("Work Files", `${employeeWorkFiles.length} uploaded`)}
-        ${waitingManagerReview ? info("Status", "Waiting for Manager Final Review") : ""}
+        ${job.reviewRound ? info("Review Round", `${formatReviewRound(job.reviewRound)} Review`) : ""}
+        ${waitingManagerReview ? info("Status", job.status === "under_review" ? "Manager is reviewing" : "Waiting for manager review") : ""}
         ${closed ? info("Status", "Manager has moved this job to delivery, billing, or closed") : ""}
       </div>
       <div class="employee-work-files">
@@ -1509,7 +1514,7 @@ function renderEmployeeJob(job) {
         <button class="ghost-button" data-action="accept" data-id="${job.id}" data-employee-id="${job.assignedTo}" ${canAccept ? "" : "disabled"}>Accept Job</button>
         <button class="primary-button" data-action="start" data-id="${job.id}" data-employee-id="${job.assignedTo}" ${canStart ? "" : "disabled"}>Start Work</button>
         <button class="primary-button" data-action="start-revision" data-id="${job.id}" data-employee-id="${job.assignedTo}" ${canStartRevision ? "" : "disabled"}>Start Revision</button>
-        <button class="primary-button" data-action="complete" data-id="${job.id}" data-employee-id="${job.assignedTo}" ${canSubmitReview && !isActionLocked("complete", job.id) ? "" : "disabled"}>${actionLabel("complete", job.id, "Submit To Manager Review", "Submitting...")}</button>
+        <button class="primary-button" data-action="complete" data-id="${job.id}" data-employee-id="${job.assignedTo}" ${canSubmitReview && !isActionLocked("complete", job.id) ? "" : "disabled"}>${actionLabel("complete", job.id, submitLabel, "Submitting...")}</button>
       </div>
     </article>
   `;
@@ -1576,12 +1581,16 @@ function handleReviewDocuments(clientId) {
   if (!clientId || !state.clients[clientId]) {
     return;
   }
+  const job = Object.values(state.jobs).find((item) => item.clientId === clientId);
+  if (job && ["sent_for_review", "resubmitted"].includes(job.status)) {
+    updateState(startManagerReview(state, { jobId: job.id, managerId: MANAGER_ID, now: now() }));
+  }
   selectedClientId = clientId;
   resetAssignDraftForClient(clientId);
   selectedWorkspaceTab = getWorkspaceTabForEntry("review_documents");
   filters.status = "all";
   currentView = "manager";
-  showToast("Client selected. Review uploaded documents in the workspace.");
+  showToast("Client selected. Review documents in the workspace.");
 }
 
 function handleAlertOpen(clientId, type) {
@@ -1758,6 +1767,7 @@ function handleSendMissingInfo(jobId) {
 function handleCompleteJob(jobId) {
   const job = state.jobs[jobId];
   const employeeId = job?.assignedTo || activeEmployeeId();
+  const isRevision = job?.status === "revision_in_progress";
   updateState(
     completeJob(state, {
       jobId,
@@ -1766,7 +1776,7 @@ function handleCompleteJob(jobId) {
       files: [],
     }),
   );
-  showToast("Job completed and sent to manager Documents To Review.");
+  showToast(isRevision ? "Revision resubmitted for manager review." : "Work sent for manager review.");
 }
 
 function handleUploadWorkFiles(jobId, employeeId) {
@@ -1798,7 +1808,7 @@ function handleApproveFinalPackage(jobId) {
     }),
   );
   selectedWorkspaceTab = "final";
-  showToast("Final package approved. Review the client email and send invoice from Final Package.");
+  showToast("Work approved. Review the client email and send invoice from Final Package.");
 }
 
 function handleRequestRevision(jobId) {
@@ -1809,7 +1819,7 @@ function handleRequestRevision(jobId) {
 
 function handleSendRevision(jobId) {
   if (!jobId) throw new Error("No job selected");
-  const note = value("#revision-note") || "Please revise the completed package before final delivery.";
+  const note = value("#revision-note") || "Please revise the package before final delivery.";
   const job = state.jobs[jobId];
   updateState(
     returnToEmployee(state, {
@@ -1822,7 +1832,7 @@ function handleSendRevision(jobId) {
   selectedEmployeeDashboardId = job?.assignedTo || selectedEmployeeDashboardId;
   selectedWorkspaceTab = "timeline";
   pendingReturnJobId = null;
-  showToast("Revision request sent to employee.");
+  showToast("Revision required and sent to employee.");
 }
 
 function handleSendFinalPackage(jobId) {
@@ -1976,11 +1986,13 @@ function resetDemo() {
 function loadState() {
   const saved = localStorage.getItem(STORAGE_KEY);
   if (!saved) {
-    const seeded = seedState();
+    const seeded = normalizeWorkflowState(seedState());
     localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
     return seeded;
   }
-  return JSON.parse(saved);
+  const parsed = normalizeWorkflowState(JSON.parse(saved));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+  return parsed;
 }
 
 function seedState() {
@@ -2144,6 +2156,12 @@ function formatDateTime(valueText) {
   }).format(new Date(valueText));
 }
 
+function formatReviewRound(round) {
+  const value = Number(round) || 1;
+  const suffix = value % 10 === 1 && value % 100 !== 11 ? "st" : value % 10 === 2 && value % 100 !== 12 ? "nd" : value % 10 === 3 && value % 100 !== 13 ? "rd" : "th";
+  return `${value}${suffix}`;
+}
+
 function formatDate(valueText) {
   if (!valueText) return "Not recorded";
   return new Intl.DateTimeFormat("en-CA", { dateStyle: "medium" }).format(new Date(valueText));
@@ -2161,7 +2179,8 @@ function capitalize(valueText) {
 
 function alertTitle(type) {
   if (type === "documents_received") return "Documents Uploaded";
-  if (type === "job_completed") return "Job Completed";
+  if (type === "sent_for_review") return "Sent for Review";
+  if (type === "resubmitted") return "Resubmitted";
   if (type === "need_more_info") return "Need More Info";
   if (type === "data_issue") return "Data Issue";
   return "Manager Alert";
@@ -2171,7 +2190,7 @@ function notificationAlertType(notification) {
   if (notification.type) return notification.type;
   const message = notification.message.toLowerCase();
   if (message.includes("uploaded")) return "documents_received";
-  if (message.includes("completed")) return "job_completed";
+  if (message.includes("review") || message.includes("resubmitted")) return "sent_for_review";
   if (message.includes("need") || message.includes("missing")) return "need_more_info";
   return "manager_alert";
 }

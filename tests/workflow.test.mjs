@@ -14,12 +14,14 @@ import {
   getVisibleJobsForUser,
   markPaymentReceived,
   needMoreInfo,
+  normalizeWorkflowState,
   receiveUploadedDocuments,
   requestDocuments,
   reassignJob,
   reviewAndBill,
   returnToEmployee,
   searchClients,
+  startManagerReview,
   startRevision,
   startJob,
   acceptJob,
@@ -29,6 +31,35 @@ import {
 } from "../src/workflow.mjs";
 
 describe("HEYDAY workflow", () => {
+  it("migrates legacy review statuses into the current workflow", () => {
+    const legacy = createInitialState();
+    legacy.clients["client-1"].status = "job_completed";
+    legacy.jobs["job-1"].status = "job_completed";
+    legacy.clients["client-2"].status = "revision_requested";
+    legacy.jobs["job-2"].status = "revision_requested";
+    legacy.clients["client-3"].status = "final_package_approved";
+    legacy.jobs["job-3"].status = "final_package_approved";
+    legacy.events = [
+      { id: "event-1", status: "job_completed" },
+      { id: "event-2", status: "revision_requested" },
+      { id: "event-3", status: "final_package_approved" },
+    ];
+
+    const migrated = normalizeWorkflowState(legacy);
+
+    assert.equal(migrated.clients["client-1"].status, "sent_for_review");
+    assert.equal(migrated.jobs["job-1"].status, "sent_for_review");
+    assert.equal(migrated.jobs["job-1"].reviewRound, 1);
+    assert.equal(migrated.clients["client-2"].status, "revision_required");
+    assert.equal(migrated.jobs["job-2"].status, "revision_required");
+    assert.equal(migrated.clients["client-3"].status, "approved");
+    assert.equal(migrated.jobs["job-3"].status, "approved");
+    assert.deepEqual(
+      migrated.events.map((event) => event.status),
+      ["sent_for_review", "revision_required", "approved"],
+    );
+  });
+
   it("creates a new client with a draft active job before sending a request email", () => {
     const state = createInitialState();
 
@@ -185,7 +216,7 @@ describe("HEYDAY workflow", () => {
     assert.equal(inbox[0].reviewType, "client_documents");
   });
 
-  it("places completed employee work into the manager review inbox", () => {
+  it("places sent employee work into the manager review inbox", () => {
     const completed = completeJob(createInitialState(), {
       jobId: "job-2",
       employeeId: "user-amy",
@@ -196,10 +227,31 @@ describe("HEYDAY workflow", () => {
     const inbox = getReviewInbox(completed, "org-heyday");
 
     assert.equal(inbox[0].client.name, "Harbour Dental Inc.");
-    assert.equal(inbox[0].status, "job_completed");
+    assert.equal(inbox[0].status, "sent_for_review");
     assert.equal(inbox[0].reviewType, "completed_work");
+    assert.equal(inbox[0].reviewRound, 1);
     assert.equal(inbox[0].fileCount, 1);
     assert.equal(inbox[0].uploadedAt, "2026-06-10T16:45:00.000Z");
+  });
+
+  it("moves sent work into first review when the manager starts review", () => {
+    let state = completeJob(createInitialState(), {
+      jobId: "job-2",
+      employeeId: "user-amy",
+      now: "2026-06-10T16:45:00.000Z",
+      files: [{ name: "completed-package.pdf", size: 4096, type: "application/pdf" }],
+    });
+
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T09:00:00.000Z",
+    });
+
+    assert.equal(state.clients["client-2"].status, "under_review");
+    assert.equal(state.jobs["job-2"].status, "under_review");
+    assert.equal(state.jobs["job-2"].reviewRound, 1);
+    assert.equal(state.events.at(-1).status, "under_review");
   });
 
   it("uploads employee work files without submitting the job", () => {
@@ -247,12 +299,12 @@ describe("HEYDAY workflow", () => {
 
     const inboxItem = getReviewInbox(state, "org-heyday").find((item) => item.clientId === "client-2");
 
-    assert.equal(state.clients["client-2"].status, "job_completed");
+    assert.equal(state.clients["client-2"].status, "sent_for_review");
     assert.equal(inboxItem.reviewType, "completed_work");
     assert.equal(inboxItem.fileCount, 1);
   });
 
-  it("removes completed work from the review inbox after final package approval", () => {
+  it("removes reviewed work from the review inbox after approval", () => {
     let state = completeJob(createInitialState(), {
       jobId: "job-2",
       employeeId: "user-amy",
@@ -262,13 +314,19 @@ describe("HEYDAY workflow", () => {
 
     assert.ok(getReviewInbox(state, "org-heyday").some((item) => item.clientId === "client-2"));
 
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T09:00:00.000Z",
+    });
+
     state = approveFinalPackage(state, {
       jobId: "job-2",
       managerId: "user-manager",
       now: "2026-06-11T11:00:00.000Z",
     });
 
-    assert.equal(state.clients["client-2"].status, "final_package_approved");
+    assert.equal(state.clients["client-2"].status, "approved");
     assert.equal(getReviewInbox(state, "org-heyday").some((item) => item.clientId === "client-2"), false);
   });
 
@@ -318,6 +376,11 @@ describe("HEYDAY workflow", () => {
       now: "2026-06-10T16:45:00.000Z",
       files: [{ name: "final-report.pdf", size: 4096, type: "application/pdf" }],
     });
+    state = startManagerReview(state, {
+      jobId: "job-1",
+      managerId: "user-manager",
+      now: "2026-06-11T09:00:00.000Z",
+    });
     state = approveFinalPackage(state, {
       jobId: "job-1",
       managerId: "user-manager",
@@ -348,8 +411,9 @@ describe("HEYDAY workflow", () => {
         "job_assigned",
         "job_accepted",
         "in_progress",
-        "job_completed",
-        "final_package_approved",
+        "sent_for_review",
+        "under_review",
+        "approved",
         "reviewed_billed",
         "payment_received",
       ],
@@ -362,6 +426,11 @@ describe("HEYDAY workflow", () => {
       employeeId: "user-amy",
       now: "2026-06-10T16:45:00.000Z",
       files: [{ name: "completed-package.pdf", size: 4096, type: "application/pdf" }],
+    });
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T09:00:00.000Z",
     });
     state = approveFinalPackage(state, {
       jobId: "job-2",
@@ -423,9 +492,14 @@ describe("HEYDAY workflow", () => {
           amount: 1250,
           now: "2026-06-11T11:00:00.000Z",
         }),
-      /final package/i,
+      /approved/i,
     );
 
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T09:00:00.000Z",
+    });
     state = approveFinalPackage(state, {
       jobId: "job-2",
       managerId: "user-manager",
@@ -448,12 +522,17 @@ describe("HEYDAY workflow", () => {
     assert.equal(state.jobs["job-2"].status, "payment_received");
   });
 
-  it("lets a manager return completed work to the assigned employee for revision", () => {
+  it("lets a manager return work under review to the assigned employee for revision", () => {
     let state = completeJob(createInitialState(), {
       jobId: "job-2",
       employeeId: "user-amy",
       now: "2026-06-10T16:45:00.000Z",
       files: [{ name: "completed-package.pdf", size: 4096, type: "application/pdf" }],
+    });
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T08:30:00.000Z",
     });
 
     state = returnToEmployee(state, {
@@ -463,15 +542,15 @@ describe("HEYDAY workflow", () => {
       now: "2026-06-11T09:00:00.000Z",
     });
 
-    assert.equal(state.clients["client-2"].status, "revision_requested");
-    assert.equal(state.jobs["job-2"].status, "revision_requested");
+    assert.equal(state.clients["client-2"].status, "revision_required");
+    assert.equal(state.jobs["job-2"].status, "revision_required");
     assert.equal(state.jobs["job-2"].revisionNote, "Please update the CRA confirmation section.");
-    assert.equal(state.events.at(-1).status, "revision_requested");
+    assert.equal(state.events.at(-1).status, "revision_required");
     assert.equal(state.notifications.at(-1).recipientId, "user-amy");
-    assert.equal(state.notifications.at(-1).type, "revision_requested");
+    assert.equal(state.notifications.at(-1).type, "revision_required");
     assert.deepEqual(
       getVisibleJobsForUser(state, "user-amy").map((job) => job.status),
-      ["revision_requested"],
+      ["revision_required"],
     );
   });
 
@@ -481,6 +560,11 @@ describe("HEYDAY workflow", () => {
       employeeId: "user-amy",
       now: "2026-06-10T16:45:00.000Z",
       files: [{ name: "completed-package.pdf", size: 4096, type: "application/pdf" }],
+    });
+    state = startManagerReview(state, {
+      jobId: "job-2",
+      managerId: "user-manager",
+      now: "2026-06-11T08:30:00.000Z",
     });
     state = returnToEmployee(state, {
       jobId: "job-2",
@@ -502,12 +586,14 @@ describe("HEYDAY workflow", () => {
 
     const inboxItem = getReviewInbox(state, "org-heyday").find((item) => item.clientId === "client-2");
 
-    assert.equal(state.clients["client-2"].status, "job_completed");
+    assert.equal(state.clients["client-2"].status, "resubmitted");
+    assert.equal(state.jobs["job-2"].reviewRound, 2);
     assert.equal(inboxItem.reviewType, "completed_work");
+    assert.equal(inboxItem.reviewRound, 2);
     assert.equal(inboxItem.fileCount, 2);
     assert.deepEqual(
       state.events.map((event) => event.status).slice(-3),
-      ["revision_requested", "in_progress", "job_completed"],
+      ["revision_required", "revision_in_progress", "resubmitted"],
     );
   });
 
@@ -731,7 +817,7 @@ describe("HEYDAY workflow", () => {
     );
   });
 
-  it("surfaces manager alerts for uploads, completed jobs, and need more info", () => {
+  it("surfaces manager alerts for uploads, sent work, and need more info", () => {
     let state = requestDocuments(createInitialState(), {
       clientId: "client-1",
       managerId: "user-manager",
@@ -759,10 +845,10 @@ describe("HEYDAY workflow", () => {
 
     assert.deepEqual(
       alerts.map((alert) => alert.type),
-      ["need_more_info", "job_completed", "documents_received"],
+      ["need_more_info", "sent_for_review", "documents_received"],
     );
     assert.match(alerts[0].message, /Missing bank statements/);
-    assert.match(alerts[1].message, /completed/);
+    assert.match(alerts[1].message, /sent .* for review/);
     assert.match(alerts[2].message, /uploaded 1 file/);
   });
 

@@ -17,7 +17,7 @@ export function getWorkspaceTabForEntry(entry) {
 
 export function getWorkspaceTabForAlert(type) {
   if (type === "documents_received") return "review";
-  if (type === "job_completed") return "review";
+  if (type === "sent_for_review" || type === "resubmitted") return "review";
   if (type === "need_more_info") return "timeline";
   if (type === "data_issue") return "timeline";
   return "profile";

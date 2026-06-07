@@ -5,9 +5,12 @@ export const STATUS_LABELS = {
   job_assigned: "Job Assigned",
   job_accepted: "Job Accepted",
   in_progress: "In Progress",
-  job_completed: "Job Completed",
-  revision_requested: "Revision Requested",
-  final_package_approved: "Final Package Approved",
+  sent_for_review: "Sent for Review",
+  under_review: "Under Review",
+  revision_required: "Revision Required",
+  revision_in_progress: "Revision In Progress",
+  resubmitted: "Resubmitted",
+  approved: "Approved",
   reviewed_billed: "Reviewed & Billed",
   payment_received: "Payment Received / Job Closed",
   need_more_info: "Need More Info",
@@ -29,6 +32,15 @@ export const FILE_SECTIONS = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const REVIEW_WAITING_STATUSES = ["sent_for_review", "resubmitted"];
+const REVIEW_ACTIVE_STATUSES = ["under_review"];
+const FINALIZED_STATUSES = ["approved", "reviewed_billed", "payment_received"];
+const EMPLOYEE_FILE_LOCKED_STATUSES = [...REVIEW_WAITING_STATUSES, ...REVIEW_ACTIVE_STATUSES, ...FINALIZED_STATUSES];
+const LEGACY_STATUS_MAP = {
+  job_completed: "sent_for_review",
+  revision_requested: "revision_required",
+  final_package_approved: "approved",
+};
 
 export function createInitialState() {
   return {
@@ -112,6 +124,7 @@ export function createInitialState() {
         acceptedAt: null,
         startedAt: null,
         completedAt: null,
+        reviewRound: 1,
       },
       "job-2": {
         id: "job-2",
@@ -128,6 +141,7 @@ export function createInitialState() {
         acceptedAt: "2026-06-02T14:20:00.000Z",
         startedAt: "2026-06-03T09:20:00.000Z",
         completedAt: null,
+        reviewRound: 1,
       },
       "job-3": {
         id: "job-3",
@@ -144,6 +158,7 @@ export function createInitialState() {
         acceptedAt: null,
         startedAt: null,
         completedAt: null,
+        reviewRound: 1,
       },
     },
     events: [],
@@ -151,6 +166,29 @@ export function createInitialState() {
     uploadRequests: [],
     notifications: [],
     billingRecords: [],
+  };
+}
+
+export function normalizeWorkflowState(state) {
+  return {
+    ...state,
+    clients: mapRecords(state.clients ?? {}, (client) => ({
+      ...client,
+      status: normalizeStatus(client.status),
+    })),
+    jobs: mapRecords(state.jobs ?? {}, (job) => ({
+      ...job,
+      status: normalizeStatus(job.status),
+      reviewRound: job.reviewRound ?? 1,
+    })),
+    events: (state.events ?? []).map((event) => ({
+      ...event,
+      status: normalizeStatus(event.status),
+    })),
+    notifications: (state.notifications ?? []).map((notification) => ({
+      ...notification,
+      type: notification.type ? normalizeStatus(notification.type) : notification.type,
+    })),
   };
 }
 
@@ -209,6 +247,7 @@ export function createClient(
           acceptedAt: null,
           startedAt: null,
           completedAt: null,
+          reviewRound: 1,
         },
       },
     },
@@ -500,8 +539,8 @@ export function reassignJob(
   if (!job.assignedTo) {
     throw new Error("Job is not assigned. Use Assign Job first.");
   }
-  if (["job_completed", "final_package_approved", "reviewed_billed", "payment_received"].includes(job.status)) {
-    throw new Error("Completed jobs cannot be reassigned");
+  if (EMPLOYEE_FILE_LOCKED_STATUSES.includes(job.status)) {
+    throw new Error("Submitted or closed jobs cannot be reassigned");
   }
 
   const previousEmployee = state.users[job.assignedTo]?.name ?? "Unassigned";
@@ -584,14 +623,14 @@ export function startJob(state, { jobId, employeeId, now }) {
 export function startRevision(state, { jobId, employeeId, now }) {
   const job = requireAssignedJob(state, jobId, employeeId);
   const client = requireClient(state, job.clientId);
-  if (job.status !== "revision_requested") {
+  if (job.status !== "revision_required") {
     throw new Error("Job is not waiting for revision");
   }
 
   return updateJobAndClient(state, {
     client,
     jobId,
-    status: "in_progress",
+    status: "revision_in_progress",
     actorId: employeeId,
     now,
     note: `${state.users[employeeId].name} started the requested revision.`,
@@ -605,7 +644,7 @@ export function uploadEmployeeWorkFiles(state, { jobId, employeeId, now, files }
   if (!files.length) {
     throw new Error("Upload at least one work file");
   }
-  if (["job_completed", "final_package_approved", "reviewed_billed", "payment_received"].includes(job.status)) {
+  if (EMPLOYEE_FILE_LOCKED_STATUSES.includes(job.status)) {
     throw new Error("Submitted or closed jobs cannot accept new employee files");
   }
 
@@ -649,6 +688,10 @@ export function completeJob(state, { jobId, employeeId, now, files }) {
     files: submittedFiles,
     now,
   });
+  const isResubmission = job.status === "revision_in_progress";
+  const nextReviewRound = isResubmission ? (job.reviewRound ?? 1) + 1 : (job.reviewRound ?? 1);
+  const nextStatus = isResubmission ? "resubmitted" : "sent_for_review";
+  const notificationType = isResubmission ? "resubmitted" : "sent_for_review";
 
   return updateJobAndClient(
     {
@@ -661,10 +704,10 @@ export function completeJob(state, { jobId, employeeId, now, files }) {
           organizationId: client.organizationId,
           recipientType: "role",
           recipientId: "manager",
-          type: "job_completed",
+          type: notificationType,
           clientId: client.id,
           jobId,
-          message: `${state.users[employeeId].name} completed ${client.name}.`,
+          message: `${state.users[employeeId].name} ${isResubmission ? "resubmitted" : "sent"} ${client.name} for review.`,
           createdAt: now,
           readAt: null,
         },
@@ -673,21 +716,45 @@ export function completeJob(state, { jobId, employeeId, now, files }) {
     {
       client,
       jobId,
-      status: "job_completed",
+      status: nextStatus,
       actorId: employeeId,
       now,
-      note: `${state.users[employeeId].name} completed the job.`,
-      jobPatch: { completedAt: now, revisionCompletedAt: job.status === "in_progress" && job.revisionNote ? now : job.revisionCompletedAt },
+      note: `${state.users[employeeId].name} ${isResubmission ? "resubmitted the revision" : "sent the job"} for manager review.`,
+      jobPatch: {
+        completedAt: now,
+        reviewRound: nextReviewRound,
+        revisionCompletedAt: isResubmission ? now : job.revisionCompletedAt,
+      },
     },
   );
+}
+
+export function startManagerReview(state, { jobId, managerId, now }) {
+  requireManager(state, managerId);
+  const job = requireJob(state, jobId);
+  const client = requireClient(state, job.clientId);
+  if (!REVIEW_WAITING_STATUSES.includes(job.status)) {
+    throw new Error("Job is not waiting for manager review");
+  }
+
+  const reviewRound = job.reviewRound ?? 1;
+  return updateJobAndClient(state, {
+    client,
+    jobId,
+    status: "under_review",
+    actorId: managerId,
+    now,
+    note: `Manager started ${formatReviewRound(reviewRound)} review.`,
+    jobPatch: { reviewRound, reviewStartedAt: now },
+  });
 }
 
 export function returnToEmployee(state, { jobId, managerId, note, now }) {
   requireManager(state, managerId);
   const job = requireJob(state, jobId);
   const client = requireClient(state, job.clientId);
-  if (job.status !== "job_completed") {
-    throw new Error("Only completed work can be returned to an employee");
+  if (job.status !== "under_review") {
+    throw new Error("Only work under review can be returned to an employee");
   }
   if (!job.assignedTo) {
     throw new Error("Job has no assigned employee to return to");
@@ -704,7 +771,7 @@ export function returnToEmployee(state, { jobId, managerId, note, now }) {
           organizationId: client.organizationId,
           recipientType: "user",
           recipientId: job.assignedTo,
-          type: "revision_requested",
+          type: "revision_required",
           clientId: client.id,
           jobId,
           message: `Revision requested: ${client.name} - ${revisionNote}`,
@@ -716,7 +783,7 @@ export function returnToEmployee(state, { jobId, managerId, note, now }) {
     {
       client,
       jobId,
-      status: "revision_requested",
+      status: "revision_required",
       actorId: managerId,
       now,
       note: `Returned to ${state.users[job.assignedTo].name}: ${revisionNote}`,
@@ -729,8 +796,8 @@ export function approveFinalPackage(state, { jobId, managerId, now, files = [] }
   requireManager(state, managerId);
   const job = requireJob(state, jobId);
   const client = requireClient(state, job.clientId);
-  if (job.status !== "job_completed") {
-    throw new Error("Only completed work can be approved for final package");
+  if (job.status !== "under_review") {
+    throw new Error("Only work under review can be approved");
   }
 
   const existingFinalFiles = state.files.filter((file) => file.jobId === jobId && file.section === "final_reports");
@@ -764,10 +831,10 @@ export function approveFinalPackage(state, { jobId, managerId, now, files = [] }
     {
       client,
       jobId,
-      status: "final_package_approved",
+      status: "approved",
       actorId: managerId,
       now,
-      note: "Manager approved the completed work for final client delivery.",
+      note: "Manager approved the reviewed work for final client delivery.",
       jobPatch: { finalPackageApprovedAt: now },
     },
   );
@@ -780,8 +847,8 @@ export function reviewAndBill(state, { jobId, managerId, invoiceNumber, amount, 
   if (["reviewed_billed", "payment_received"].includes(job.status)) {
     throw new Error("Job already reviewed and billed");
   }
-  if (job.status !== "final_package_approved") {
-    throw new Error("Final package must be approved before sending invoice");
+  if (job.status !== "approved") {
+    throw new Error("Work must be approved before sending invoice");
   }
   if (state.billingRecords.some((record) => record.jobId === jobId)) {
     throw new Error("Job already reviewed and billed");
@@ -968,7 +1035,7 @@ export function getManagerDashboard(state, organizationId, now) {
 
   const today = new Date(now);
   const overdueJobs = jobs
-    .filter((job) => job.dueDate && !["job_completed", "reviewed_billed", "payment_received"].includes(job.status))
+    .filter((job) => job.dueDate && !FINALIZED_STATUSES.includes(job.status))
     .filter((job) => new Date(`${job.dueDate}T23:59:59.999Z`) < today)
     .map((job) => hydrateJob(state, job));
 
@@ -978,9 +1045,9 @@ export function getManagerDashboard(state, organizationId, now) {
     activeJobs: jobs.filter(
       (job) =>
         job.assignedTo === employee.id &&
-        !["job_completed", "reviewed_billed", "payment_received"].includes(job.status),
+        !FINALIZED_STATUSES.includes(job.status),
     ).length,
-    completedJobs: jobs.filter((job) => job.assignedTo === employee.id && job.status === "job_completed").length,
+    completedJobs: jobs.filter((job) => job.assignedTo === employee.id && FINALIZED_STATUSES.includes(job.status)).length,
   }));
 
   return {
@@ -995,10 +1062,10 @@ export function getManagerDashboard(state, organizationId, now) {
 export function getReviewInbox(state, organizationId) {
   return Object.values(state.clients)
     .filter((client) => client.organizationId === organizationId)
-    .filter((client) => ["documents_received", "job_completed"].includes(client.status))
+    .filter((client) => ["documents_received", ...REVIEW_WAITING_STATUSES].includes(client.status))
     .map((client) => {
       const job = getJobByClientId(state, client.id);
-      const reviewType = client.status === "job_completed" ? "completed_work" : "client_documents";
+      const reviewType = REVIEW_WAITING_STATUSES.includes(client.status) ? "completed_work" : "client_documents";
       const reviewSection = reviewType === "completed_work" ? "employee_work" : "client_uploaded";
       const reviewFiles = state.files.filter((file) => file.clientId === client.id && file.section === reviewSection);
       const latestUpload = reviewFiles
@@ -1012,6 +1079,7 @@ export function getReviewInbox(state, organizationId) {
         job,
         status: client.status,
         reviewType,
+        reviewRound: job?.reviewRound ?? 1,
         fileCount: reviewFiles.length,
         uploadedAt: latestUpload ?? client.statusChangedAt,
       };
@@ -1185,6 +1253,14 @@ function updateRecord(records, id, patch) {
   };
 }
 
+function mapRecords(records, mapper) {
+  return Object.fromEntries(Object.entries(records).map(([id, record]) => [id, mapper(record)]));
+}
+
+function normalizeStatus(status) {
+  return LEGACY_STATUS_MAP[status] ?? status;
+}
+
 function requireManager(state, userId) {
   const user = requireUser(state, userId);
   if (user.role !== "manager") {
@@ -1305,9 +1381,15 @@ function latestAlertKey(state, type, clientId, jobId) {
 function inferAlertType(message) {
   const normalized = message.toLowerCase();
   if (normalized.includes("uploaded")) return "documents_received";
-  if (normalized.includes("completed")) return "job_completed";
+  if (normalized.includes("review") || normalized.includes("resubmitted")) return "sent_for_review";
   if (normalized.includes("need") || normalized.includes("missing")) return "need_more_info";
   return "manager_alert";
+}
+
+function formatReviewRound(round) {
+  const value = Number(round) || 1;
+  const suffix = value % 10 === 1 && value % 100 !== 11 ? "st" : value % 10 === 2 && value % 100 !== 12 ? "nd" : value % 10 === 3 && value % 100 !== 13 ? "rd" : "th";
+  return `${value}${suffix}`;
 }
 
 function nextRecordId(prefix, records) {
