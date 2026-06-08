@@ -92,6 +92,32 @@ button {
   gap: 8px;
 }
 
+.data-tools-menu {
+  align-items: center;
+  display: inline-flex;
+  position: relative;
+}
+
+.data-tools-dropdown {
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 14px 35px rgba(25, 37, 31, 0.15);
+  display: grid;
+  gap: 6px;
+  min-width: 200px;
+  padding: 6px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 10;
+}
+
+.data-tools-dropdown .ghost-button.compact-button {
+  justify-content: flex-start;
+  width: 100%;
+}
+
 .tab,
 .ghost-button,
 .primary-button,

@@ -63,6 +63,7 @@ let managerAlertFilter = "all";
 let pendingFocusRestore = null;
 let employeeJobFilter = "all";
 let previewFileId = null;
+let showDataToolsMenu = false;
 const actionLocker = createActionLocker(2000);
 const LOCKED_ACTIONS = new Set([
   "request-docs",
@@ -84,7 +85,17 @@ render();
 
 app.addEventListener("click", (event) => {
   const target = event.target.closest("[data-action]");
-  if (!target) return;
+  const insideDataTools = event.target.closest(".data-tools-menu");
+  if (!target) {
+    if (showDataToolsMenu && !insideDataTools) {
+      showDataToolsMenu = false;
+      render();
+    }
+    return;
+  }
+  if (!insideDataTools && showDataToolsMenu) {
+    showDataToolsMenu = false;
+  }
   if (target.closest(".client-table") && target.matches("button")) {
     event.stopPropagation();
   }
@@ -134,6 +145,14 @@ app.addEventListener("click", (event) => {
     if (action === "send-missing-info") handleSendMissingInfo(id);
     if (action === "undo-last") undoLastAction();
     if (action === "reset") resetDemo();
+    if (action === "toggle-data-tools") {
+      showDataToolsMenu = !showDataToolsMenu;
+      render();
+      return;
+    }
+    if (action === "export-data" || action === "import-data") {
+      showDataToolsMenu = false;
+    }
     if (action === "import-data") triggerClientDataImport();
     if (action === "export-data") exportClientDataToFile();
     if (action === "request-docs") handleRequestDocs(id);
@@ -262,8 +281,10 @@ function render() {
           </select>
           <button class="ghost-button" data-action="undo-last" ${historyStack.length ? "" : "disabled"}>Undo Last Action</button>
           <button class="ghost-button" data-action="reset">Reset Demo</button>
-          <button class="ghost-button" data-action="export-data">导出客户资料数据库</button>
-          <button class="ghost-button" data-action="import-data">导入客户资料数据库</button>
+          <div class="data-tools-menu">
+            <button class="ghost-button compact-button data-tools-toggle" data-action="toggle-data-tools">Data Tools</button>
+            ${showDataToolsMenu ? renderDataToolsMenu() : ""}
+          </div>
           <input
             id="client-db-import-input"
             type="file"
@@ -1990,6 +2011,15 @@ function saveState(nextState = state) {
   state = normalized;
 }
 
+function renderDataToolsMenu() {
+  return `
+    <div class="data-tools-dropdown" aria-label="Data tools actions">
+      <button class="ghost-button compact-button" data-action="export-data">Export Client Database</button>
+      <button class="ghost-button compact-button" data-action="import-data">Import Client Database</button>
+    </div>
+  `;
+}
+
 function triggerClientDataImport() {
   const input = document.querySelector("#client-db-import-input");
   if (input) {
@@ -2011,26 +2041,26 @@ function exportClientDataToFile() {
     anchor.click();
     URL.revokeObjectURL(anchor.href);
     anchor.remove();
-    showToast("导出完成。");
+    showToast("Client database export completed.");
   } catch (error) {
-    showToast(`导出失败：${error.message}`);
+    showToast(`Export failed: ${error.message}`);
   }
 }
 
 function handleImportClientDatabase(raw) {
   const result = importClientData(raw);
   if (!result.ok) {
-    showToast(result.error || "导入失败，请检查文件内容。");
+    showToast(result.error || "Import failed. Please check the JSON content.");
     return;
   }
-  const confirmMessage = `确认要覆盖当前 ${Object.keys(state.clients).length} 个客户及 ${Object.keys(state.jobs).length} 个案件为导入版本吗？\n\n导入预览：${result.summary.clients} 客户，${result.summary.jobs} 案件，${result.summary.events} 条事件`;
+  const confirmMessage = `Replace current database with this file?\n\nCurrent: ${Object.keys(state.clients).length} clients, ${Object.keys(state.jobs).length} jobs\nImported: ${result.summary.clients} clients, ${result.summary.jobs} jobs, ${result.summary.events} events`;
   const shouldImport = window.confirm(confirmMessage);
   if (!shouldImport) {
     return;
   }
 
   state = resetImportState(result.state);
-  showToast("客户资料已导入，数据库已更新。");
+  showToast("Client database imported successfully.");
 }
 
 function resetImportState(importedState) {
