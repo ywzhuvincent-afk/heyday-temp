@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test tests/workflow.test.mjs tests/workspace.test.mjs tests/ui-helpers.test.mjs"
+    "test": "node --test tests/workflow.test.mjs tests/workspace.test.mjs tests/ui-helpers.test.mjs tests/data-store.test.mjs"
   }
 }

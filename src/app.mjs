@@ -7,7 +7,6 @@
   assignJob,
   completeJob,
   createClient,
-  createInitialState,
   getManagerDashboard,
   getManagerAlerts,
   getReviewInbox,
@@ -15,7 +14,6 @@
   getVisibleJobsForUser,
   markPaymentReceived,
   needMoreInfo,
-  normalizeWorkflowState,
   receiveUploadedDocuments,
   requestDocuments,
   reassignJob,
@@ -37,13 +35,13 @@ import {
   filterJobsByEmployeeStatus,
   filterReviewInboxByType,
 } from "./ui-helpers.mjs";
+import { exportClientData, importClientData, loadPersistentState, resetToSeededState, savePersistentState } from "./data-store.mjs";
 
-const STORAGE_KEY = "heyday.workflow.state.v1";
 const ORGANIZATION_ID = "org-heyday";
 const MANAGER_ID = "user-manager";
 
 const app = document.querySelector("#app");
-let state = loadState();
+let state = loadPersistentState();
 let currentUserId = MANAGER_ID;
 let currentView = new URLSearchParams(location.search).has("upload") ? "upload" : "manager";
 let selectedClientId = "client-1";
@@ -136,6 +134,8 @@ app.addEventListener("click", (event) => {
     if (action === "send-missing-info") handleSendMissingInfo(id);
     if (action === "undo-last") undoLastAction();
     if (action === "reset") resetDemo();
+    if (action === "import-data") triggerClientDataImport();
+    if (action === "export-data") exportClientDataToFile();
     if (action === "request-docs") handleRequestDocs(id);
     if (action === "assign-job") handleAssignJob(id);
     if (action === "undo-assignment") handleUndoAssignment(id);
@@ -214,6 +214,23 @@ app.addEventListener("change", (event) => {
     managerAlertFilter = target.value;
     shouldRender = true;
   }
+  if (target.id === "client-db-import-input") {
+    const file = target.files?.[0];
+    if (!file) {
+      target.value = "";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      handleImportClientDatabase(String(reader.result || ""));
+      target.value = "";
+    };
+    reader.onerror = () => {
+      showToast("Failed to read the selected import file.");
+      target.value = "";
+    };
+    reader.readAsText(file);
+  }
   if (shouldRender) render();
 });
 
@@ -245,6 +262,14 @@ function render() {
           </select>
           <button class="ghost-button" data-action="undo-last" ${historyStack.length ? "" : "disabled"}>Undo Last Action</button>
           <button class="ghost-button" data-action="reset">Reset Demo</button>
+          <button class="ghost-button" data-action="export-data">导出客户资料数据库</button>
+          <button class="ghost-button" data-action="import-data">导入客户资料数据库</button>
+          <input
+            id="client-db-import-input"
+            type="file"
+            accept="application/json,.json"
+            style="display: none;"
+          />
         </div>
       </header>
       <main class="content">
@@ -1960,13 +1985,88 @@ function captureAssignDraftFields() {
   if (dueDate !== undefined) assignDraft.dueDate = dueDate;
 }
 
-function resetDemo() {
-  localStorage.removeItem(STORAGE_KEY);
-  state = seedState();
-  saveState();
-  currentView = "manager";
-  selectedClientId = "client-1";
+function saveState(nextState = state) {
+  const normalized = savePersistentState(nextState);
+  state = normalized;
+}
+
+function triggerClientDataImport() {
+  const input = document.querySelector("#client-db-import-input");
+  if (input) {
+    input.click();
+    return;
+  }
+  showToast("Import input is not available.");
+}
+
+function exportClientDataToFile() {
+  try {
+    const payload = exportClientData(state);
+    const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
+    const fileName = `heyday-client-data-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    URL.revokeObjectURL(anchor.href);
+    anchor.remove();
+    showToast("导出完成。");
+  } catch (error) {
+    showToast(`导出失败：${error.message}`);
+  }
+}
+
+function handleImportClientDatabase(raw) {
+  const result = importClientData(raw);
+  if (!result.ok) {
+    showToast(result.error || "导入失败，请检查文件内容。");
+    return;
+  }
+  const confirmMessage = `确认要覆盖当前 ${Object.keys(state.clients).length} 个客户及 ${Object.keys(state.jobs).length} 个案件为导入版本吗？\n\n导入预览：${result.summary.clients} 客户，${result.summary.jobs} 案件，${result.summary.events} 条事件`;
+  const shouldImport = window.confirm(confirmMessage);
+  if (!shouldImport) {
+    return;
+  }
+
+  state = resetImportState(result.state);
+  showToast("客户资料已导入，数据库已更新。");
+}
+
+function resetImportState(importedState) {
+  state = importedState;
+  historyStack = [];
+  currentUserId = MANAGER_ID;
+  showCreateClientForm = false;
+  createClientDraft = emptyCreateClientDraft();
+  editClientDraft = emptyEditClientDraft();
+  editingClientId = null;
+  pendingNeedInfoJobId = null;
+  pendingReturnJobId = null;
+  selectedClientId = Object.keys(state.clients).includes("client-1")
+    ? "client-1"
+    : Object.values(state.clients)[0]?.id || "";
   selectedWorkspaceTab = "profile";
+  currentView = "manager";
+  selectedEmployeeDashboardId = "user-amy";
+  filters = { query: "", status: "all", employeeId: "all" };
+  employeeJobFilter = "all";
+  reviewInboxFilter = "all";
+  managerAlertFilter = "all";
+  previewFileId = null;
+  pendingFocusRestore = null;
+  saveState();
+  return state;
+}
+
+function resetDemo() {
+  state = resetToSeededState();
+  historyStack = [];
+  currentUserId = MANAGER_ID;
+  showCreateClientForm = false;
+  selectedClientId = Object.keys(state.clients).includes("client-1") ? "client-1" : Object.values(state.clients)[0]?.id || "";
+  selectedWorkspaceTab = "profile";
+  currentView = "manager";
   assignDraft = { employeeId: "user-amy", priority: "medium", instructions: "", dueDate: "" };
   createClientDraft = emptyCreateClientDraft();
   editClientDraft = emptyEditClientDraft();
@@ -1981,56 +2081,6 @@ function resetDemo() {
   pendingFocusRestore = null;
   filters = { query: "", status: "all", employeeId: "all" };
   showToast("Demo data reset.");
-}
-
-function loadState() {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (!saved) {
-    const seeded = normalizeWorkflowState(seedState());
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
-    return seeded;
-  }
-  const parsed = normalizeWorkflowState(JSON.parse(saved));
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-  return parsed;
-}
-
-function seedState() {
-  let next = createInitialState();
-  next = createClient(next, {
-    organizationId: ORGANIZATION_ID,
-    managerId: MANAGER_ID,
-    name: "Cedar Bookkeeping Co.",
-    contactName: "Elena Moss",
-    email: "elena@cedarbooks.ca",
-    phone: "(604) 555-0166",
-    notes: "New client waiting for document request email.",
-    now: "2026-06-06T09:00:00.000Z",
-  });
-  next = requestDocuments(next, {
-    clientId: "client-3",
-    managerId: MANAGER_ID,
-    now: "2026-06-01T10:30:00.000Z",
-  });
-  next.files = [
-    {
-      id: "file-seed-1",
-      organizationId: ORGANIZATION_ID,
-      clientId: "client-1",
-      jobId: "job-1",
-      section: "client_uploaded",
-      name: "bank-statements.pdf",
-      size: 1245000,
-      type: "application/pdf",
-      uploadedBy: "client",
-      uploadedAt: "2026-06-05T15:10:00.000Z",
-    },
-  ];
-  return next;
-}
-
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
 function tab(id, label, current) {
@@ -2216,5 +2266,3 @@ function escapeHtml(valueText) {
 function escapeAttr(valueText) {
   return escapeHtml(valueText);
 }
-
-
