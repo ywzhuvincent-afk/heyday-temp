@@ -39,6 +39,9 @@ import { exportClientData, importClientData, loadPersistentState, resetToSeededS
 
 const ORGANIZATION_ID = "org-heyday";
 const MANAGER_ID = "user-manager";
+const AUTH_STORAGE_KEY = "heyday.auth.session.v1";
+const SESSION_DEFAULT_PASSWORD = "111111";
+const PASSWORD_MIN_LENGTH = 4;
 
 const app = document.querySelector("#app");
 let state = loadPersistentState();
@@ -64,6 +67,14 @@ let pendingFocusRestore = null;
 let employeeJobFilter = "all";
 let previewFileId = null;
 let showDataToolsMenu = false;
+let settingsMode = null;
+let settingsReturnView = "manager";
+let pendingImport = null;
+let importStatusMessage = "";
+let importPhase = "idle";
+let importStatusClearTimer = null;
+let pendingEmployeeDeletion = null;
+let authSession = loadAuthSession();
 const actionLocker = createActionLocker(2000);
 const LOCKED_ACTIONS = new Set([
   "request-docs",
@@ -80,6 +91,252 @@ const LOCKED_ACTIONS = new Set([
   "payment",
   "save-client",
 ]);
+
+function getSessionScopeLabel(scope) {
+  if (scope === "admin") return "Admin";
+  if (scope === "manager") return "Manager";
+  if (scope === "employee") return "Employee";
+  return "Guest";
+}
+
+function normalizeRole(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function getUserPassword(userId) {
+  const user = state.users[userId];
+  return String(user?.password || "").trim() || SESSION_DEFAULT_PASSWORD;
+}
+
+function isEmployeeUser(user) {
+  const role = normalizeRole(user?.role);
+  return role === "employee" || role === "staff" || role === "member";
+}
+
+function isManagerRole(user) {
+  return normalizeRole(user?.role) === "manager";
+}
+
+function isAdminRole(user) {
+  return normalizeRole(user?.role) === "admin";
+}
+
+function isSystemRole(user) {
+  return isManagerRole(user) || isAdminRole(user) || String(user?.id || "").trim() === MANAGER_ID;
+}
+
+function isStaffUser(user) {
+  const role = normalizeRole(user?.role);
+  if (role) {
+    return isEmployeeUser({ role });
+  }
+  return Boolean(user?.id && !isSystemRole(user));
+}
+
+function nextRecordId(prefix, records) {
+  const nextNumber = Object.keys(records).reduce((highest, id) => {
+    const match = String(id).match(new RegExp(`^${prefix}-(\\d+)$`));
+    return match ? Math.max(highest, Number(match[1])) : highest;
+  }, 0) + 1;
+  return `${prefix}-${nextNumber}`;
+}
+
+function resolveEmployeeIdForLogin() {
+  const users = Object.values(state.users);
+  const employeeUser = users.find(isStaffUser);
+  if (employeeUser?.id) {
+    return employeeUser.id;
+  }
+
+  const nonSystemUser = users.find((user) => !isSystemRole(user));
+  if (nonSystemUser?.id) {
+    return nonSystemUser.id;
+  }
+  return "";
+}
+
+function normalizeAuthSession() {
+  if (!authSession) {
+    return true;
+  }
+
+  const scope = authScope();
+  if (scope === "employee") {
+    const employee = state.users[authSession.userId];
+    if (!employee) {
+      clearAuthSession();
+      authSession = null;
+      return false;
+    }
+    return true;
+  }
+
+  if (scope === "manager" || scope === "admin") {
+    if (!state.users[authSession.userId]) {
+      authSession = { ...authSession, userId: MANAGER_ID };
+      saveAuthSession(authSession);
+      return true;
+    }
+    return true;
+  }
+
+  clearAuthSession();
+  authSession = null;
+  return false;
+}
+
+function authScope() {
+  const scope = String(authSession?.scope || "").trim();
+  if (scope === "admin" || scope === "manager" || scope === "employee") {
+    return scope;
+  }
+  return "guest";
+}
+
+function resolveSystemAccountId(scope = "manager") {
+  if (scope === "admin") {
+    const adminUser = Object.values(state.users).find((user) => isAdminRole(user));
+    if (adminUser?.id) {
+      return adminUser.id;
+    }
+  }
+  const managerUser = state.users[MANAGER_ID];
+  if (managerUser?.id) {
+    return managerUser.id;
+  }
+  const legacyManager = Object.values(state.users).find((user) => isManagerRole(user));
+  return legacyManager?.id || MANAGER_ID;
+}
+
+function authUser() {
+  if (!authSession?.userId) {
+    return state.users[MANAGER_ID];
+  }
+  return state.users[authSession.userId] || state.users[MANAGER_ID];
+}
+
+function isLoggedIn() {
+  const scope = authScope();
+  return scope === "manager" || scope === "admin" || scope === "employee";
+}
+
+function canViewManagerPlatform() {
+  return authScope() === "manager" || authScope() === "admin";
+}
+
+function canViewEmployeePlatform() {
+  return authScope() === "employee" || authScope() === "admin";
+}
+
+function canViewDatabase() {
+  return canViewManagerPlatform();
+}
+
+function canViewUploadPortal() {
+  return true;
+}
+
+function canAccessView(viewId) {
+  if (authScope() === "admin") return true;
+  if (authScope() === "manager") {
+    return viewId === "manager" || viewId === "database" || viewId === "upload";
+  }
+  if (authScope() === "employee") {
+    return viewId === "employee";
+  }
+  return false;
+}
+
+function getAccessibleViews() {
+  if (authScope() === "admin") {
+    return ["manager", "employee", "upload", "database"];
+  }
+  if (authScope() === "manager") {
+    return ["manager", "database", "upload"];
+  }
+  if (authScope() === "employee") {
+    return ["employee"];
+  }
+  return [];
+}
+
+function canOpenSettingsMode(mode) {
+  if (mode === "manager-password" || mode === "team-management") {
+    return canViewManagerPlatform();
+  }
+  if (mode === "employee-password") {
+    return canViewEmployeePlatform() || canViewManagerPlatform();
+  }
+  return false;
+}
+
+function openSettingsMode(mode) {
+  if (!canOpenSettingsMode(mode)) {
+    showToast("You do not have permission to open this settings page.");
+    return;
+  }
+  settingsMode = mode;
+  settingsReturnView = currentView || (canViewManagerPlatform() ? "manager" : "employee");
+  showDataToolsMenu = false;
+}
+
+function closeSettingsMode() {
+  const accessibleViews = getAccessibleViews();
+  if (!accessibleViews.includes(settingsReturnView)) {
+    settingsReturnView = accessibleViews[0] || (canViewManagerPlatform() ? "manager" : "employee");
+  }
+  settingsMode = null;
+  currentView = settingsReturnView;
+}
+
+function getManagerSession() {
+  const scope = authScope();
+  const user = authSession?.userId ? state.users[authSession.userId] : null;
+  return {
+    username: authSession?.username || "",
+    displayName: user?.name || (scope === "admin" ? "System Admin" : scope === "employee" ? "Employee" : "Manager"),
+    scope: scope,
+    userId: authSession?.userId || MANAGER_ID,
+  };
+}
+
+function loadAuthSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.scope || !parsed.userId) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveAuthSession(session) {
+  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+}
+
+function clearAuthSession() {
+  localStorage.removeItem(AUTH_STORAGE_KEY);
+  pendingEmployeeDeletion = null;
+}
+
+function logout() {
+  authSession = null;
+  clearAuthSession();
+  showDataToolsMenu = false;
+  settingsMode = null;
+  if (new URLSearchParams(location.search).has("upload")) {
+    currentView = "upload";
+  } else {
+    currentView = "manager";
+  }
+  render();
+}
 
 render();
 
@@ -104,6 +361,46 @@ app.addEventListener("click", (event) => {
   const id = target.dataset.id;
 
   try {
+    if (action === "login") {
+      const scope = target.dataset.scope;
+      const username = target.dataset.username || "";
+      handleLogin(scope, username);
+      return;
+    }
+    if (action === "logout") {
+      logout();
+      return;
+    }
+    if (action === "toggle-data-tools") {
+      showDataToolsMenu = !showDataToolsMenu;
+      render();
+      return;
+    }
+    if (action === "open-settings") {
+      openSettingsMode(id);
+      render();
+      return;
+    }
+    if (action === "close-settings") {
+      closeSettingsMode();
+      render();
+      return;
+    }
+    if (action === "view" && !canAccessView(id)) {
+      return;
+    }
+    if (!isLoggedIn() && !new URLSearchParams(location.search).has("upload")) {
+      showToast("Please login before continuing.");
+      return;
+    }
+
+    if (authScope() === "employee" && action === "employee-view-select" && id) {
+      const targetUserId = target.value || id;
+      if (targetUserId !== authSession?.userId) {
+        return;
+      }
+    }
+
     if (LOCKED_ACTIONS.has(action)) {
       const key = actionLockKey(action, target);
       if (!actionLocker.tryLock(key)) {
@@ -114,8 +411,16 @@ app.addEventListener("click", (event) => {
       window.setTimeout(() => render(), 2050);
     }
 
-    if (action === "view") currentView = id;
-    if (action === "role") currentUserId = id;
+    if (action === "view") {
+      showDataToolsMenu = false;
+      currentView = id;
+      settingsMode = null;
+    }
+    if (action === "role" && canViewManagerPlatform()) {
+      currentView = "manager";
+      currentUserId = id;
+      settingsMode = null;
+    }
     if (action === "select-client") handleSelectClient(id);
     if (action === "workspace-tab") handleWorkspaceTab(id);
     if (action === "workspace-back") handleWorkspaceBack();
@@ -145,15 +450,34 @@ app.addEventListener("click", (event) => {
     if (action === "send-missing-info") handleSendMissingInfo(id);
     if (action === "undo-last") undoLastAction();
     if (action === "reset") resetDemo();
-    if (action === "toggle-data-tools") {
-      showDataToolsMenu = !showDataToolsMenu;
-      render();
+    if (action === "view") {
+      currentView = id;
+      settingsMode = null;
+    }
+    if (action === "confirm-import") {
+      applyPendingImport();
       return;
     }
-    if (action === "export-data" || action === "import-data") {
+    if (action === "confirm-delete-employee") {
+      applyPendingEmployeeDelete();
+      return;
+    }
+    if (action === "cancel-delete-employee") {
+      cancelPendingEmployeeDelete();
+      return;
+    }
+    if (action === "cancel-import") {
+      cancelPendingImport();
+      return;
+    }
+    if (action === "export-data" || action === "import-data" || action === "download-template") {
       showDataToolsMenu = false;
     }
-    if (action === "import-data") triggerClientDataImport();
+    if (action === "import-data") {
+      triggerClientDataImport();
+      return;
+    }
+    if (action === "download-template") downloadImportTemplate();
     if (action === "export-data") exportClientDataToFile();
     if (action === "request-docs") handleRequestDocs(id);
     if (action === "assign-job") handleAssignJob(id);
@@ -168,6 +492,17 @@ app.addEventListener("click", (event) => {
     if (action === "upload-work-files") handleUploadWorkFiles(id, target.dataset.employeeId || activeEmployeeId());
     if (action === "complete") handleCompleteJob(id);
     if (action === "upload") handleUpload();
+    if (action === "save-password") handleSavePassword(id);
+    if (action === "set-employee-password") handleSetEmployeePassword(id);
+    if (action === "add-employee") handleAddEmployee();
+    if (action === "delete-employee") {
+      requestDeleteEmployee(id);
+      return;
+    }
+    if (action === "status-open") {
+      handleStatusOpen(id);
+      return;
+    }
   } catch (error) {
     showToast(error.message);
   }
@@ -218,6 +553,15 @@ app.addEventListener("change", (event) => {
   if (target.id === "assign-employee") assignDraft.employeeId = target.value;
   if (target.id === "assign-priority") assignDraft.priority = target.value;
   if (target.id === "employee-view-select") {
+    if (authScope() === "employee") {
+      const forcedEmployeeId = authSession?.userId;
+      if (forcedEmployeeId) {
+        target.value = forcedEmployeeId;
+      }
+      selectedEmployeeDashboardId = forcedEmployeeId || target.value;
+      shouldRender = true;
+      return;
+    }
     selectedEmployeeDashboardId = target.value;
     shouldRender = true;
   }
@@ -233,30 +577,43 @@ app.addEventListener("change", (event) => {
     managerAlertFilter = target.value;
     shouldRender = true;
   }
-  if (target.id === "client-db-import-input") {
-    const file = target.files?.[0];
-    if (!file) {
-      target.value = "";
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      handleImportClientDatabase(String(reader.result || ""));
-      target.value = "";
-    };
-    reader.onerror = () => {
-      showToast("Failed to read the selected import file.");
-      target.value = "";
-    };
-    reader.readAsText(file);
-  }
   if (shouldRender) render();
 });
 
 function render() {
+  const hasUploadParam = new URLSearchParams(location.search).has("upload") || new URLSearchParams(location.search).has("token");
+  const isUploadPath = currentView === "upload" || hasUploadParam;
+  if (!isLoggedIn() && !isUploadPath) {
+    app.innerHTML = renderLoginLanding();
+    return;
+  }
+  if (!normalizeAuthSession()) {
+    app.innerHTML = renderLoginLanding();
+    return;
+  }
+
+  if (authScope() === "employee") {
+    const employeeId = authSession?.userId;
+    if (employeeId && state.users[employeeId]) {
+      currentUserId = employeeId;
+      selectedEmployeeDashboardId = employeeId;
+    }
+  }
   const currentUser = state.users[currentUserId];
+  const accessibleViews = getAccessibleViews();
+  if (!accessibleViews.includes(currentView)) {
+    currentView = accessibleViews[0] || "manager";
+  }
+
+  const showDataTools = canViewManagerPlatform() || canViewEmployeePlatform();
+  const showUndoReset = canViewManagerPlatform();
   app.innerHTML = `
     <div class="app-shell">
+      <div class="import-notice-stack">
+        ${importStatusMessage ? renderImportStatusBanner() : ""}
+        ${pendingImport ? renderPendingImportPanel() : ""}
+        ${pendingEmployeeDeletion ? renderPendingEmployeeDeletePanel() : ""}
+      </div>
       <header class="topbar">
         <div class="brand">
           <span class="brand-mark">HD</span>
@@ -266,55 +623,422 @@ function render() {
           </div>
         </div>
         <nav class="view-tabs" aria-label="Primary views">
-          ${tab("manager", "Manager", currentView)}
-          ${tab("employee", "Employee", currentView)}
-          ${tab("upload", "Upload Portal", currentView)}
+          ${accessibleViews.includes("manager") ? tab("manager", "Manager", currentView) : ""}
+          ${accessibleViews.includes("employee") ? tab("employee", "Employee", currentView) : ""}
+          ${accessibleViews.includes("upload") ? tab("upload", "Upload Portal", currentView) : ""}
         </nav>
         <div class="role-switcher">
-          <select id="user-select" aria-label="Current user">
-            ${Object.values(state.users)
-              .map(
-                (user) =>
-                  `<option value="${user.id}" ${user.id === currentUserId ? "selected" : ""}>${escapeHtml(user.name)} · ${user.role}</option>`,
-              )
-              .join("")}
-          </select>
-          <button class="ghost-button" data-action="undo-last" ${historyStack.length ? "" : "disabled"}>Undo Last Action</button>
-          <button class="ghost-button" data-action="reset">Reset Demo</button>
-          <div class="data-tools-menu">
-            <button class="ghost-button compact-button data-tools-toggle" data-action="toggle-data-tools">Data Tools</button>
-            ${showDataToolsMenu ? renderDataToolsMenu() : ""}
+          <div class="session-chip">
+            <span>${escapeHtml(getManagerSession().displayName)}</span>
+            <span class="session-scope">${escapeHtml(getSessionScopeLabel(authScope()))}</span>
           </div>
+          ${showUndoReset ? `<button class="ghost-button" data-action="undo-last" ${historyStack.length ? "" : "disabled"}>Undo Last Action</button>` : ""}
+          ${showUndoReset ? `<button class="ghost-button" data-action="reset">Reset Demo</button>` : ""}
+          ${showDataTools ? `<div class="data-tools-menu">
+            <button class="ghost-button compact-button data-tools-toggle" data-action="toggle-data-tools" title="Tools / Settings" aria-label="Tools / Settings menu">⚙</button>
+            ${showDataToolsMenu ? renderDataToolsMenu() : ""}
+          </div>` : ""}
+          <button class="ghost-button" data-action="logout">Logout</button>
           <input
             id="client-db-import-input"
             type="file"
-            accept="application/json,.json"
+            accept="application/json,.json,text/csv,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx,application/vnd.ms-excel,.xls"
             style="display: none;"
           />
         </div>
       </header>
       <main class="content">
-        ${currentView === "manager" ? renderManager() : ""}
-        ${currentView === "employee" ? renderEmployee(currentUser) : ""}
-        ${currentView === "upload" ? renderUploadPortal() : ""}
+        ${settingsMode ? renderSettingsPage() : ""}
+        ${!settingsMode && currentView === "manager" && canViewManagerPlatform() ? renderManager() : ""}
+        ${!settingsMode && currentView === "database" && canViewDatabase() ? renderDatabaseView() : ""}
+        ${!settingsMode && currentView === "employee" && canViewEmployeePlatform() ? renderEmployee(currentUser) : ""}
+        ${!settingsMode && currentView === "upload" && canViewUploadPortal() ? renderUploadPortal() : ""}
       </main>
       ${toastMessage ? `<div class="toast">${escapeHtml(toastMessage)}</div>` : ""}
     </div>
   `;
 
-  const userSelect = document.querySelector("#user-select");
-  userSelect?.addEventListener("change", (event) => {
-    currentUserId = event.target.value;
-    if (state.users[currentUserId].role === "employee" && currentView === "manager") {
-      currentView = "employee";
-    }
-    if (state.users[currentUserId].role === "employee") {
-      selectedEmployeeDashboardId = currentUserId;
-    }
-    render();
-  });
+  const importInput = document.querySelector("#client-db-import-input");
+  if (importInput) {
+    importInput.onchange = (event) => handleClientDbImportInputChange(event.target);
+  }
 
   restorePendingFocus();
+}
+
+function renderLoginLanding() {
+  const employeeList = Object.values(state.users).filter((user) => {
+    return isEmployeeUser(user) || !isManagerRole(user);
+  });
+  const fallbackEmployeeId = resolveEmployeeIdForLogin();
+  const hasEmployees = employeeList.length > 0;
+  const fallbackOnly = !hasEmployees && Boolean(fallbackEmployeeId);
+  return `
+    <div class="auth-shell">
+      <div class="auth-panel">
+        <div class="auth-brand">
+          <span class="brand-mark">HD</span>
+          <div>
+            <div class="brand-title">HEYDAY Workflow</div>
+            <div class="brand-subtitle">Client jobs & client delivery operations platform</div>
+          </div>
+        </div>
+
+        <div class="auth-grid">
+          <section class="auth-card">
+            <div class="auth-card-title">Manager Login</div>
+            <div class="auth-card-subtitle">Use this to access manager-level dashboards and operations.</div>
+            <label class="field">
+              <span>Account</span>
+              <input id="manager-username" value="manager" autocomplete="username" placeholder="manager or admin" />
+            </label>
+            <label class="field">
+              <span>Password</span>
+              <input id="manager-password" type="password" placeholder="Password" />
+            </label>
+            <div class="button-row">
+              <button class="primary-button" data-action="login" data-scope="manager" data-username="manager">Manager Login</button>
+              <button class="primary-button" data-action="login" data-scope="admin" data-username="admin">Admin Login</button>
+            </div>
+            <div class="auth-note">Default demo credentials are no longer shown. Please set a secure password for manager/admin in Team Management.</div>
+          </section>
+
+          <section class="auth-card">
+            <div class="auth-card-title">Employee Login</div>
+            <div class="auth-card-subtitle">Only employee platform, no manager panel</div>
+            <label class="field">
+              <span>Employee</span>
+              <select id="employee-login-user" ${fallbackEmployeeId ? "" : "disabled"}>
+                ${employeeList.length
+                ? employeeList
+                .map((user) => `<option value="${user.id}">${escapeHtml(user.name)} · ${escapeHtml(user.email || user.id)}</option>`)
+                .join("")
+                : fallbackEmployeeId
+                  ? `<option value="${fallbackEmployeeId}">${escapeHtml(state.users[fallbackEmployeeId]?.name || fallbackEmployeeId)}</option>`
+                  : `<option value="">No employee account found</option>`}
+              </select>
+            </label>
+            <label class="field">
+              <span>Password</span>
+              <input id="employee-password" type="password" placeholder="Password" />
+            </label>
+            <div class="button-row">
+              <button class="primary-button" data-action="login" data-scope="employee" ${fallbackEmployeeId ? "" : "disabled"}>Employee Login</button>
+            </div>
+            <div class="auth-note">If an account has no saved password, a temporary fallback password is used.</div>
+            ${fallbackOnly ? `<div class="auth-note">No user role labeled as employee found in current data. Using ${escapeHtml(state.users[fallbackEmployeeId]?.name || fallbackEmployeeId)} for employee demo login.</div>` : ""}
+          </section>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function handleLogin(scope, fallbackUsername = "") {
+  const username = authInputValue("manager-username") || String(fallbackUsername || "").trim() || "manager";
+  const managerPassword = authInputValue("manager-password");
+  const employeePassword = authInputValue("employee-password");
+  const managerUser = String(scope || "").toLowerCase();
+  const managerScopeId = managerUser === "admin" ? resolveSystemAccountId("admin") : resolveSystemAccountId("manager");
+  const managerAuthPassword = getUserPassword(managerScopeId);
+
+  if (managerUser === "manager") {
+    if (managerPassword !== managerAuthPassword) {
+      showToast("Invalid manager password.");
+      return;
+    }
+    authSession = {
+      scope: "manager",
+      userId: managerScopeId,
+      username,
+      displayName: "Manager",
+    };
+  }
+
+  if (managerUser === "admin") {
+    if (managerPassword !== managerAuthPassword) {
+      showToast("Invalid admin password.");
+      return;
+    }
+    authSession = {
+      scope: "admin",
+      userId: managerScopeId,
+      username,
+      displayName: "System Admin",
+    };
+  }
+
+  if (managerUser === "employee") {
+    const explicitEmployeeId = value("employee-login-user");
+    const fallbackEmployeeId = resolveEmployeeIdForLogin();
+    const employeeId = explicitEmployeeId || fallbackEmployeeId || "";
+    if (!employeeId || !state.users[employeeId]) {
+      showToast("No valid employee found in current database. Please import an employee user first.");
+      return;
+    }
+    const expectedEmployeePassword = getUserPassword(employeeId);
+    if (employeePassword !== expectedEmployeePassword) {
+      showToast("Invalid employee password.");
+      return;
+    }
+    authSession = {
+      scope: "employee",
+      userId: employeeId,
+      username: state.users[employeeId].name,
+      displayName: state.users[employeeId].name,
+    };
+  }
+
+  if (!authSession) {
+    showToast("Unknown login path. Please try again.");
+    return;
+  }
+
+  currentUserId = authSession.userId;
+  selectedEmployeeDashboardId = authSession.userId;
+  selectedClientId = Object.keys(state.clients)[0] || "client-1";
+  settingsMode = null;
+  showDataToolsMenu = false;
+  if (authSession.scope === "employee") {
+    currentView = "employee";
+  } else {
+    currentView = "manager";
+  }
+  saveAuthSession(authSession);
+  clearImportState();
+  render();
+}
+
+function clearImportState() {
+  pendingImport = null;
+  importStatusMessage = "";
+  importPhase = "idle";
+  clearImportStatusClearTimer();
+  pendingEmployeeDeletion = null;
+}
+
+function requestDeleteEmployee(targetUserId) {
+  if (!targetUserId || !state.users[targetUserId]) {
+    showToast("Employee not found.");
+    return;
+  }
+
+  const user = state.users[targetUserId];
+  if (isSystemRole(user)) {
+    showToast("Manager account cannot be deleted.");
+    return;
+  }
+
+  pendingEmployeeDeletion = {
+    targetUserId,
+    name: user.name || targetUserId,
+    displayEmail: user.email || "",
+    canSelfDelete: authSession?.userId === targetUserId,
+  };
+  render();
+}
+
+function applyPendingEmployeeDelete() {
+  const targetUserId = pendingEmployeeDeletion?.targetUserId;
+  if (!targetUserId || !state.users[targetUserId]) {
+    pendingEmployeeDeletion = null;
+    render();
+    return;
+  }
+
+  const user = state.users[targetUserId];
+  if (isSystemRole(user)) {
+    pendingEmployeeDeletion = null;
+    showToast("Manager account cannot be deleted.");
+    render();
+    return;
+  }
+
+  const nextUsers = { ...state.users };
+  delete nextUsers[targetUserId];
+
+  const nextJobs = Object.fromEntries(
+    Object.entries(state.jobs).map(([jobId, job]) => [jobId, job.assignedTo === targetUserId ? { ...job, assignedTo: null } : job]),
+  );
+
+  const nextNotifications = state.notifications.filter(
+    (notification) => !(notification.recipientType === "user" && notification.recipientId === targetUserId),
+  );
+
+  const nextState = {
+    ...state,
+    users: nextUsers,
+    jobs: nextJobs,
+    notifications: nextNotifications,
+  };
+
+  if (authSession?.userId === targetUserId) {
+    clearAuthSession();
+    authSession = null;
+    if (new URLSearchParams(location.search).has("upload")) {
+      currentView = "upload";
+    } else {
+      currentView = "manager";
+    }
+  }
+  if (selectedEmployeeDashboardId === targetUserId) {
+    selectedEmployeeDashboardId = Object.values(nextUsers).find((item) => isStaffUser(item))?.id || "user-amy";
+  }
+  if (currentUserId === targetUserId) {
+    currentUserId = MANAGER_ID;
+  }
+
+  saveState(nextState);
+  historyStack = [];
+  pendingEmployeeDeletion = null;
+  showToast(`Employee ${user.name} has been removed.`);
+
+  if (!isLoggedIn()) {
+    render();
+    return;
+  }
+  render();
+}
+
+function cancelPendingEmployeeDelete() {
+  pendingEmployeeDeletion = null;
+  showToast("Employee deletion cancelled.");
+  render();
+}
+
+function authInputValue(id) {
+  return String(document.querySelector(`#${id}`)?.value || "").trim();
+}
+
+function handleClientDbImportInputChange(fileInput) {
+  const file = fileInput?.files?.[0];
+  if (!file) {
+    updateImportStatus("No file selected.", "error");
+    return;
+  }
+
+  pendingImport = null;
+  updateImportStatus(`Import file selected: ${file.name} (${file.size} bytes).`, "selected");
+  const fileType = detectFileExtension(file);
+  const fileSource = fileType === "json" ? "JSON" : fileType === "csv" ? "CSV" : fileType === "xlsx" || fileType === "xls" ? "Excel" : "Unknown";
+
+  const onHandled = () => {
+    if (!pendingImport && importPhase !== "success") {
+      importPhase = "idle";
+    }
+    render();
+  };
+  const showParsedSummary = (counts, sourceHint = fileSource) => {
+    if (!counts || typeof counts.totalRows !== "number" || typeof counts.validRows !== "number") {
+      return;
+    }
+    const summaryMessage = `Detected ${counts.totalRows} lines (${counts.validRows} valid records) from ${sourceHint}`;
+    updateImportStatus(summaryMessage, "parsed");
+  };
+
+  (async () => {
+    try {
+      updateImportStatus(`Parsing file (${fileSource})...`, "parsing");
+
+      if (fileType === "json") {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            handleImportClientDatabase(String(reader.result || ""), { source: "json" });
+          } catch (error) {
+            updateImportStatus(error?.message || "Failed to parse JSON file.", "error");
+            onHandled();
+            return;
+          }
+          onHandled();
+        };
+        reader.onerror = () => {
+          updateImportStatus("Failed to read the selected import file.", "error");
+          onHandled();
+        };
+        reader.readAsText(file);
+        return;
+      }
+
+      if (fileType === "csv") {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const parsed = parseCsvRows(reader.result || "");
+          showParsedSummary({ totalRows: parsed.totalRows, validRows: parsed.validRows }, "CSV");
+          if (parsed.validRows === 0) {
+            updateImportStatus("No valid client rows in spreadsheet", "error");
+            onHandled();
+            return;
+          }
+          handleImportClientDatabase(parsed.rows, { source: "csv", ...parsed });
+          onHandled();
+        };
+        reader.onerror = () => {
+          updateImportStatus("Failed to read the selected import file.", "error");
+          onHandled();
+        };
+        reader.readAsText(file);
+        return;
+      }
+
+      if (fileType === "xlsx" || fileType === "xls") {
+        const buffer = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error("Failed to read the selected import file."));
+          reader.readAsArrayBuffer(file);
+        });
+        const parsed = await parseXlsxRows(buffer);
+        showParsedSummary({ totalRows: parsed.totalRows, validRows: parsed.validRows }, "Excel");
+        if (parsed.validRows === 0) {
+          updateImportStatus("No valid client rows in spreadsheet", "error");
+          onHandled();
+          return;
+        }
+        handleImportClientDatabase(parsed.rows, { source: "xlsx", ...parsed });
+        onHandled();
+        return;
+      }
+
+      updateImportStatus("Unsupported file format. Please upload JSON, CSV, XLSX, or XLS.", "error");
+      onHandled();
+    } catch (error) {
+      updateImportStatus(error?.message || "Failed to import file.", "error");
+      onHandled();
+    }
+  })();
+}
+
+function updateImportStatus(message, phase = "idle", autoClearMs = 0) {
+  clearImportStatusClearTimer();
+  importStatusMessage = message;
+  importPhase = phase;
+  showToast(message);
+  render();
+  scheduleImportStatusClear(phase, autoClearMs);
+}
+
+function clearImportStatusClearTimer() {
+  if (importStatusClearTimer) {
+    window.clearTimeout(importStatusClearTimer);
+    importStatusClearTimer = null;
+  }
+}
+
+function scheduleImportStatusClear(messagePhase, delayMs = 0) {
+  clearImportStatusClearTimer();
+  if (!delayMs || messagePhase !== "success") {
+    return;
+  }
+  importStatusClearTimer = window.setTimeout(() => {
+    if (importPhase !== "success") {
+      return;
+    }
+    importStatusMessage = "";
+    importPhase = "idle";
+    importStatusClearTimer = null;
+    render();
+  }, delayMs);
 }
 
 function renderManager() {
@@ -432,14 +1156,259 @@ function renderManager() {
   `;
 }
 
+function renderPasswordPanel(userId, includeCurrentScopeHint = false) {
+  const user = state.users[userId];
+  if (!user) {
+    return '<div class="empty-state">Account unavailable.</div>';
+  }
+  const accountLabel = includeCurrentScopeHint ? `${user.name} (Current login)` : user.name;
+  return `
+    <div class="detail-body">
+      <div class="field">
+        <span>Account</span>
+        <div class="locked-name">${escapeHtml(accountLabel)} · ${escapeHtml(user.id)}</div>
+      </div>
+      <label class="field">
+        <span>Current Password</span>
+        <input id="user-password-current-${user.id}" type="password" placeholder="Current password" />
+      </label>
+      <label class="field">
+        <span>New Password</span>
+        <input id="user-password-new-${user.id}" type="password" placeholder="New password" />
+      </label>
+      <label class="field">
+        <span>Confirm New Password</span>
+        <input id="user-password-confirm-${user.id}" type="password" placeholder="Confirm new password" />
+      </label>
+      <div class="action-grid">
+        <button class="primary-button" data-action="save-password" data-id="${user.id}">
+          Save Password
+        </button>
+      </div>
+      <div class="auth-note">Default password for new records is <strong>${SESSION_DEFAULT_PASSWORD}</strong>.</div>
+    </div>
+  `;
+}
+
+function renderTeamManagement() {
+  const activeEmployees = employees();
+  const sortedEmployees = activeEmployees.slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  return `
+    <div class="detail-body">
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title">Add Employee</div>
+        </div>
+        <div class="detail-body">
+          <label class="field">
+            <span>Employee Name</span>
+            <input id="new-employee-name" placeholder="Employee full name" />
+          </label>
+          <label class="field">
+            <span>Email</span>
+            <input id="new-employee-email" placeholder="name@company.com" />
+          </label>
+          <label class="field">
+            <span>Employee ID (optional)</span>
+            <input id="new-employee-id" placeholder="Auto-generated if empty" />
+          </label>
+          <label class="field">
+            <span>Initial Password</span>
+            <input id="new-employee-password" type="password" placeholder="Set login password" value="${SESSION_DEFAULT_PASSWORD}" />
+          </label>
+          <div class="action-grid">
+            <button class="primary-button" data-action="add-employee">Add Employee</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title">Current Employees</div>
+        </div>
+        <div class="table-wrap database-table-wrap">
+          <table class="database-table">
+            <thead>
+              <tr>
+                <th>Employee</th>
+                <th>Email</th>
+                <th>Password</th>
+                <th>Action</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sortedEmployees
+                .map((user) => {
+                  const safeId = escapeAttr(user.id);
+                  return `
+                    <tr>
+                      <td>${escapeHtml(user.name)} · ${escapeHtml(user.id)}</td>
+                      <td>${escapeHtml(user.email || "—")}</td>
+                      <td>
+                        <div class="field">
+                          <input id="employee-password-new-${safeId}" type="password" placeholder="New password" />
+                        </div>
+                        <div class="field">
+                          <input id="employee-password-confirm-${safeId}" type="password" placeholder="Confirm password" />
+                        </div>
+                      </td>
+                      <td><button class="ghost-button compact-button" data-action="set-employee-password" data-id="${safeId}">Set Password</button></td>
+                      <td><button class="danger-button compact-button" data-action="delete-employee" data-id="${safeId}">Delete</button></td>
+                    </tr>
+                  `;
+                })
+                .join("") || `<tr><td colspan="5" class="muted">No employee found.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDatabaseView() {
+  const organizationClients = Object.values(state.clients)
+    .filter(
+    (client) => client.organizationId === ORGANIZATION_ID || !client.organizationId,
+    )
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const organizationJobs = Object.values(state.jobs)
+    .filter((job) => job.organizationId === ORGANIZATION_ID || !job.organizationId)
+    .sort((a, b) => (a.dueDate || "").localeCompare(b.dueDate || ""));
+  const organizationUsers = Object.values(state.users).filter(
+    (user) => !user.organizationId || user.organizationId === ORGANIZATION_ID || user.id === MANAGER_ID,
+  );
+  const events = state.events || [];
+  const files = state.files || [];
+  const uploadRequests = state.uploadRequests || [];
+
+  const clientsById = Object.fromEntries(organizationClients.map((client) => [client.id, client]));
+  const clientJobs = {};
+  organizationJobs.forEach((job) => {
+    const list = clientJobs[job.clientId] || [];
+    list.push(job);
+    clientJobs[job.clientId] = list;
+  });
+  return `
+    <div class="database-grid">
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <div class="section-title">Client Database</div>
+            <div class="section-subtitle">Read-only view of current stored clients, jobs, and related records.</div>
+          </div>
+        </div>
+        <div class="metric-grid">
+          ${dbMetric("Total Clients", String(organizationClients.length))}
+          ${dbMetric("Total Jobs", String(organizationJobs.length))}
+          ${dbMetric("Events", String(events.length))}
+          ${dbMetric("Files", String(files.length))}
+          ${dbMetric("Upload Requests", String(uploadRequests.length))}
+          ${dbMetric("Staff", String(organizationUsers.length))}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <div class="section-title">Client Records</div>
+            <div class="section-subtitle">All client entities in this workspace.</div>
+          </div>
+        </div>
+        <div class="table-wrap database-table-wrap">
+          <table class="database-table">
+            <thead>
+              <tr>
+                <th>Client ID</th>
+                <th>Client Name</th>
+                <th>Contact</th>
+                <th>Email</th>
+                <th>Phone</th>
+                <th>Status</th>
+                <th>Jobs</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${organizationClients
+                .map((client) => {
+                  const jobs = clientJobs[client.id] || [];
+                  const linkedJobIds = jobs.map((job) => job.id).join(", ") || "No job";
+                  return `
+                    <tr>
+                      <td>${escapeHtml(client.id)}</td>
+                      <td>${escapeHtml(client.name)}</td>
+                      <td>${escapeHtml(client.contactName || "—")}</td>
+                      <td>${escapeHtml(client.email || "—")}</td>
+                      <td>${escapeHtml(client.phone || "—")}</td>
+                      <td>${statusPill(client.status)}</td>
+                      <td>${escapeHtml(linkedJobIds)}</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+          ${organizationClients.length ? "" : '<div class="empty-state">No client records in database yet.</div>'}
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <div>
+            <div class="section-title">Job Records</div>
+            <div class="section-subtitle">All jobs connected to clients.</div>
+          </div>
+        </div>
+        <div class="table-wrap database-table-wrap">
+          <table class="database-table">
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Client</th>
+                <th>Title</th>
+                <th>Assigned To</th>
+                <th>Status</th>
+                <th>Due Date</th>
+                <th>Review Round</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${organizationJobs
+                .map((job) => {
+                  const clientName = clientsById[job.clientId]?.name || "(Unknown client)";
+                  const employee = job.assignedTo ? state.users[job.assignedTo] : null;
+                  return `
+                    <tr>
+                      <td>${escapeHtml(job.id)}</td>
+                      <td>${escapeHtml(clientName)}</td>
+                      <td>${escapeHtml(job.title || "—")}</td>
+                      <td>${escapeHtml(employee?.name || "Unassigned")}</td>
+                      <td>${statusPill(job.status)}</td>
+                      <td>${job.dueDate ? formatDate(job.dueDate) : "—"}</td>
+                      <td>${escapeHtml(String(job.reviewRound || 1))}</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+          ${organizationJobs.length ? "" : '<div class="empty-state">No job records in database yet.</div>'}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderEmployee(currentUser) {
   const employeeId = activeEmployeeId();
-  const employee = state.users[employeeId];
+  const employee = state.users[employeeId] || state.users[MANAGER_ID];
   const jobs = getVisibleJobsForUser(state, employeeId);
   const filteredJobs = filterJobsByEmployeeStatus(jobs, employeeJobFilter);
   const alerts = state.notifications
     .filter((item) => item.recipientId === employeeId)
     .reverse();
+  const canSwitchEmployeeView = canViewManagerPlatform();
 
   return `
     <div class="employee-grid">
@@ -452,17 +1421,22 @@ function renderEmployee(currentUser) {
           <span class="status-pill">${jobs.length} assigned</span>
         </div>
         <div class="detail-body">
-          <label class="field">
-            <span>Viewing Employee</span>
-            <select id="employee-view-select">
-              ${employees()
-                .map(
-                  (user) =>
-                    `<option value="${user.id}" ${employeeId === user.id ? "selected" : ""}>${escapeHtml(user.name)}</option>`,
-                )
-                .join("")}
-            </select>
-          </label>
+          ${canSwitchEmployeeView
+            ? `<label class="field">
+                <span>Viewing Employee</span>
+                <select id="employee-view-select">
+                  ${employees()
+                    .map(
+                      (user) =>
+                        `<option value="${user.id}" ${employeeId === user.id ? "selected" : ""}>${escapeHtml(user.name)}</option>`,
+                    )
+                    .join("")}
+                </select>
+              </label>`
+            : `<div class="field compact-field">
+                <span>Viewing Employee</span>
+                <div class="locked-name">${escapeHtml(employee.name)} (${escapeHtml(employeeId)})</div>
+              </div>`}
           <label class="field">
             <span>Job Status</span>
             <select id="employee-job-filter">
@@ -764,7 +1738,7 @@ function renderClientTable(clients) {
                     <div class="client-name">${escapeHtml(client.name)}</div>
                     <div class="muted small">${escapeHtml(client.email)} · ${escapeHtml(client.phone)}</div>
                   </td>
-                  <td>${statusPill(client.status)}</td>
+                  <td>${statusPillWithAction(client.status, client.id)}</td>
                   <td>${assignedStaffCell(client, employee)}</td>
                   <td>${job?.dueDate ? formatDate(job.dueDate) : `<span class="muted">No due date</span>`}</td>
                   <td>${job ? priorityPill(job.priority) : ""}</td>
@@ -838,7 +1812,7 @@ function renderClientWorkspace(client) {
         <div class="section-subtitle">${escapeHtml(client.contactName)} · ${escapeHtml(client.phone)} · ${escapeHtml(client.email)}</div>
       </div>
       <div class="workspace-header-actions">
-        ${statusPill(client.status)}
+        ${statusPillWithAction(client.status, client.id)}
         <button class="ghost-button" data-action="workspace-back" ${workspaceBackStack.length ? "" : "disabled"}>Back Section</button>
       </div>
     </div>
@@ -1575,6 +2549,15 @@ function metric(status, label, value) {
   `;
 }
 
+function dbMetric(label, value) {
+  return `
+    <div class="metric">
+      <div class="metric-value">${escapeHtml(String(value))}</div>
+      <div class="metric-label">${escapeHtml(label)}</div>
+    </div>
+  `;
+}
+
 function handleRequestDocs(clientId) {
   updateState(requestDocuments(state, { clientId, managerId: MANAGER_ID, now: now() }));
   selectedClientId = clientId;
@@ -1984,6 +2967,182 @@ function handleOpenCreateClientFromSearch() {
   showCreateClientForm = true;
 }
 
+function handleSavePassword(targetUserId) {
+  if (!targetUserId) {
+    showToast("Invalid account.");
+    return;
+  }
+  const user = state.users[targetUserId];
+  if (!user) {
+    showToast("Account not found.");
+    return;
+  }
+
+  const currentPassword = authInputValue(`user-password-current-${targetUserId}`);
+  const nextPassword = authInputValue(`user-password-new-${targetUserId}`);
+  const confirmPassword = authInputValue(`user-password-confirm-${targetUserId}`);
+  const expectedCurrentPassword = getUserPassword(targetUserId);
+
+  if (currentPassword !== expectedCurrentPassword) {
+    showToast("Current password is incorrect.");
+    return;
+  }
+  if (nextPassword.length < PASSWORD_MIN_LENGTH) {
+    showToast(`Password must be at least ${PASSWORD_MIN_LENGTH} characters.`);
+    return;
+  }
+  if (nextPassword !== confirmPassword) {
+    showToast("The new passwords do not match.");
+    return;
+  }
+
+  state.users[targetUserId] = { ...user, password: nextPassword };
+  saveState();
+  const currentPasswordInput = document.querySelector(`#${cssEscape(`user-password-current-${targetUserId}`)}`);
+  const nextPasswordInput = document.querySelector(`#${cssEscape(`user-password-new-${targetUserId}`)}`);
+  const confirmPasswordInput = document.querySelector(`#${cssEscape(`user-password-confirm-${targetUserId}`)}`);
+  if (currentPasswordInput) {
+    currentPasswordInput.value = "";
+  }
+  if (nextPasswordInput) {
+    nextPasswordInput.value = "";
+  }
+  if (confirmPasswordInput) {
+    confirmPasswordInput.value = "";
+  }
+  showToast(`Password updated for ${user.name}.`);
+  render();
+}
+
+function handleSetEmployeePassword(targetUserId) {
+  if (!targetUserId || !state.users[targetUserId]) {
+    showToast("Employee account not found.");
+    return;
+  }
+  const nextPassword = authInputValue(`employee-password-new-${targetUserId}`);
+  const confirmPassword = authInputValue(`employee-password-confirm-${targetUserId}`);
+  if (nextPassword.length < PASSWORD_MIN_LENGTH) {
+    showToast(`Password must be at least ${PASSWORD_MIN_LENGTH} characters.`);
+    return;
+  }
+  if (nextPassword !== confirmPassword) {
+    showToast("The new passwords do not match.");
+    return;
+  }
+
+  state.users[targetUserId] = {
+    ...state.users[targetUserId],
+    password: nextPassword,
+  };
+  saveState();
+  const inputNewId = `employee-password-new-${targetUserId}`;
+  const inputConfirmId = `employee-password-confirm-${targetUserId}`;
+  const newPasswordInput = document.querySelector(`#${cssEscape(inputNewId)}`);
+  const confirmInput = document.querySelector(`#${cssEscape(inputConfirmId)}`);
+  if (newPasswordInput) {
+    newPasswordInput.value = "";
+  }
+  if (confirmInput) {
+    confirmInput.value = "";
+  }
+  showToast(`Password updated for ${state.users[targetUserId].name}.`);
+  if (authSession?.userId === targetUserId && authSession?.scope === "employee") {
+    showToast(`${state.users[targetUserId].name} should log in again using new password.`);
+  }
+  render();
+}
+
+function sanitizeEmployeeId(rawId) {
+  const normalized = String(rawId || "").trim().toLowerCase().replace(/[^a-z0-9-_]/g, "-");
+  const trimmed = normalized.replace(/-+/g, "-").replace(/(^-|-$)/g, "");
+  if (trimmed) {
+    return trimmed;
+  }
+  return "";
+}
+
+function handleAddEmployee() {
+  const name = authInputValue("new-employee-name").trim();
+  const email = authInputValue("new-employee-email").trim();
+  const preferredId = sanitizeEmployeeId(authInputValue("new-employee-id"));
+  const password = authInputValue("new-employee-password");
+
+  if (!name) {
+    showToast("Employee name is required.");
+    return;
+  }
+  if (password.length < PASSWORD_MIN_LENGTH) {
+    showToast(`Initial password must be at least ${PASSWORD_MIN_LENGTH} characters.`);
+    return;
+  }
+
+  const generatedId = preferredId || nextRecordId("user", state.users);
+  if (state.users[generatedId]) {
+    showToast(`Employee ID already exists: ${generatedId}`);
+    return;
+  }
+
+  const nextUsers = {
+    ...state.users,
+    [generatedId]: {
+      id: generatedId,
+      organizationId: ORGANIZATION_ID,
+      name,
+      email,
+      role: "employee",
+      password,
+    },
+  };
+  updateState({
+    ...state,
+    users: nextUsers,
+  });
+
+  showToast(`Employee "${name}" added as ${generatedId}.`);
+  const nameInput = document.querySelector("#new-employee-name");
+  const emailInput = document.querySelector("#new-employee-email");
+  const employeeIdInput = document.querySelector("#new-employee-id");
+  const passwordInput = document.querySelector("#new-employee-password");
+  if (nameInput) {
+    nameInput.value = "";
+  }
+  if (emailInput) {
+    emailInput.value = "";
+  }
+  if (employeeIdInput) {
+    employeeIdInput.value = "";
+  }
+  if (passwordInput) {
+    passwordInput.value = SESSION_DEFAULT_PASSWORD;
+  }
+  render();
+}
+
+function renderPendingEmployeeDeletePanel() {
+  if (!pendingEmployeeDeletion?.targetUserId) {
+    return "";
+  }
+
+  const emailText = pendingEmployeeDeletion.displayEmail
+    ? ` <span class="muted">${escapeHtml(pendingEmployeeDeletion.displayEmail)}</span>`
+    : "";
+  return `
+    <section class="import-confirm-banner danger-action-banner">
+      <div class="import-confirm-main">
+        <div class="import-confirm-title">Delete Employee</div>
+        <div class="import-confirm-summary">
+          Remove <strong>${escapeHtml(pendingEmployeeDeletion.name)}</strong>${emailText ? `${emailText}` : ""} ?
+          ${pendingEmployeeDeletion.canSelfDelete ? "<br/>You are currently logged in as this employee and will be signed out." : ""}
+        </div>
+      </div>
+      <div class="import-confirm-actions">
+        <button class="danger-button compact-button" data-action="confirm-delete-employee">Delete</button>
+        <button class="ghost-button compact-button" data-action="cancel-delete-employee">Cancel</button>
+      </div>
+    </section>
+  `;
+}
+
 function handleCancelCreateClient() {
   createClientDraft = emptyCreateClientDraft();
   showCreateClientForm = false;
@@ -2012,17 +3171,119 @@ function saveState(nextState = state) {
 }
 
 function renderDataToolsMenu() {
+  const showManagerTools = canViewManagerPlatform();
+  const showEmployeeTools = canViewEmployeePlatform();
   return `
-    <div class="data-tools-dropdown" aria-label="Data tools actions">
-      <button class="ghost-button compact-button" data-action="export-data">Export Client Database</button>
-      <button class="ghost-button compact-button" data-action="import-data">Import Client Database</button>
+    <div class="data-tools-dropdown" aria-label="Quick actions">
+      <div class="data-tools-group-title">Database</div>
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="view" data-id="database">Open Database</button>` : ""}
+
+      ${showManagerTools ? `<div class="data-tools-group-title">Data Tools</div>` : ""}
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="export-data">Export Client Database</button>` : ""}
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="import-data">Import Client Database</button>` : ""}
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="download-template">Download Import Template</button>` : ""}
+
+      ${showManagerTools ? `<div class="data-tools-group-title">Manager Settings</div>` : ""}
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="open-settings" data-id="manager-password">Manager Password</button>` : ""}
+      ${showManagerTools ? `<button class="ghost-button compact-button" data-action="open-settings" data-id="team-management">Team Management</button>` : ""}
+
+      ${showEmployeeTools && !showManagerTools ? `<div class="data-tools-group-title">Employee Settings</div>` : ""}
+      ${showEmployeeTools && !showManagerTools ? `<button class="ghost-button compact-button" data-action="open-settings" data-id="employee-password">Password</button>` : ""}
     </div>
+  `;
+}
+
+function renderSettingsPage() {
+  if (!settingsMode) {
+    return "";
+  }
+  if (settingsMode === "manager-password") {
+    return `
+      <section class="section">
+        <div class="section-header">
+          <button class="ghost-button compact-button" data-action="close-settings">← Back</button>
+          <div>
+            <div class="section-title">Manager Password</div>
+            <div class="section-subtitle">Update password for the current Manager/Admin account.</div>
+          </div>
+          <span class="status-pill">Settings</span>
+        </div>
+        ${renderPasswordPanel(authSession?.userId || MANAGER_ID, false)}
+      </section>
+    `;
+  }
+  if (settingsMode === "team-management") {
+    return `
+      <section class="section">
+        <div class="section-header">
+          <button class="ghost-button compact-button" data-action="close-settings">← Back</button>
+          <div>
+            <div class="section-title">Team Management</div>
+            <div class="section-subtitle">Add employees, update passwords, or remove staff.</div>
+          </div>
+        </div>
+        ${renderTeamManagement()}
+      </section>
+    `;
+  }
+  if (settingsMode === "employee-password") {
+    const employee = currentUserForContext();
+    if (!employee) {
+      closeSettingsMode();
+      return "";
+    }
+    return `
+      <section class="section">
+        <div class="section-header">
+          <button class="ghost-button compact-button" data-action="close-settings">← Back</button>
+          <div>
+            <div class="section-title">Password</div>
+            <div class="section-subtitle">Update your employee password.</div>
+          </div>
+        </div>
+        ${renderPasswordPanel(employee.id, true)}
+      </section>
+    `;
+  }
+  return "";
+}
+
+function currentUserForContext() {
+  return state.users[currentUserId] || state.users[MANAGER_ID];
+}
+
+function renderPendingImportPanel() {
+  if (!pendingImport) {
+    return "";
+  }
+  const sourceLabel = pendingImport.source === "json" ? "JSON" : pendingImport.source === "xlsx" || pendingImport.source === "xls" ? "Excel" : pendingImport.source === "csv" ? "CSV" : pendingImport.source === "spreadsheet" ? "Spreadsheet" : "Unknown";
+  const linesSummary = pendingImport.parseMeta && Number.isFinite(pendingImport.parseMeta.totalRows) ? `Lines: ${pendingImport.parseMeta.totalRows} (${pendingImport.parseMeta.validRows} valid)` : "";
+  return `
+    <section class="import-confirm-banner">
+      <div class="import-confirm-main">
+        <div class="import-confirm-title">Replace current database with this file?</div>
+        <div class="import-confirm-summary">
+          Imported: ${pendingImport.summary.clients} clients, ${pendingImport.summary.jobs} jobs
+          ${linesSummary ? `<br/>${linesSummary}` : ""}
+          ${sourceLabel ? `<br/>Source: ${sourceLabel}` : ""}
+        </div>
+      </div>
+      <div class="import-confirm-actions">
+        <button class="ghost-button compact-button" data-action="confirm-import">Confirm Import</button>
+        <button class="ghost-button compact-button" data-action="cancel-import">Cancel</button>
+      </div>
+    </section>
   `;
 }
 
 function triggerClientDataImport() {
   const input = document.querySelector("#client-db-import-input");
   if (input) {
+    pendingImport = null;
+    importPhase = "idle";
+    importStatusMessage = "Import file dialog opened. Pick a JSON/CSV/XLSX/XLS file.";
+    showToast(importStatusMessage);
+    input.value = "";
     input.click();
     return;
   }
@@ -2047,25 +3308,104 @@ function exportClientDataToFile() {
   }
 }
 
-function handleImportClientDatabase(raw) {
+function handleImportClientDatabase(raw, importMeta = null) {
   const result = importClientData(raw);
   if (!result.ok) {
-    showToast(result.error || "Import failed. Please check the JSON content.");
+    const errorMessage = result.error || "Import failed. Please check the source file.";
+    updateImportStatus(errorMessage, "error");
+    pendingImport = null;
     return;
   }
-  const confirmMessage = `Replace current database with this file?\n\nCurrent: ${Object.keys(state.clients).length} clients, ${Object.keys(state.jobs).length} jobs\nImported: ${result.summary.clients} clients, ${result.summary.jobs} jobs, ${result.summary.events} events`;
-  const shouldImport = window.confirm(confirmMessage);
-  if (!shouldImport) {
+  if (!result.summary || (result.summary.clients === 0 && result.summary.jobs === 0)) {
+    updateImportStatus("No valid client rows in spreadsheet", "error");
     return;
   }
+  const source = importMeta || result.meta || {};
+  pendingImport = {
+    raw,
+    summary: result.summary,
+    parseMeta: {
+      totalRows: source.totalRows,
+      validRows: source.validRows,
+    },
+    source: source.source || "unknown",
+    nextState: result.state,
+  };
+  importPhase = "ready";
+  importStatusMessage = `Parsed import ready. Imported: ${result.summary.clients} clients, ${result.summary.jobs} jobs.`;
+  showToast(importStatusMessage);
+  render();
+}
 
-  state = resetImportState(result.state);
-  showToast("Client database imported successfully.");
+function applyPendingImport() {
+  if (!pendingImport?.nextState) {
+    return;
+  }
+  const toImport = pendingImport;
+  pendingImport = null;
+  state = resetImportState(toImport.nextState);
+  const currentViewClientCount = searchClients(state, { organizationId: ORGANIZATION_ID, ...filters }).length;
+  const successMessage = `Imported and loaded: ${toImport.summary.clients} clients, ${toImport.summary.jobs} jobs. Current view: ${currentViewClientCount} clients.`;
+  updateImportStatus(successMessage, "success", 2600);
+}
+
+function cancelPendingImport() {
+  if (!pendingImport) {
+    return;
+  }
+  pendingImport = null;
+  importPhase = "idle";
+  importStatusMessage = "Import cancelled.";
+  showToast("Import cancelled.");
+  render();
+}
+
+function renderImportStatusBanner() {
+  if (!importStatusMessage) {
+    return "";
+  }
+  const phaseClass = importPhase ? ` import-status-${importPhase}` : "";
+  return `
+    <section class="import-status-banner${phaseClass}">
+      <div class="import-status-label">${escapeHtml(importPhase?.toUpperCase() || "INFO")}</div>
+      ${escapeHtml(importStatusMessage)}
+    </section>
+  `;
+}
+
+function downloadImportTemplate() {
+  const header = ["client_name", "contact_name", "email", "phone", "status", "assigned_to", "due_date", "job_title", "notes", "review_round"];
+  const rows = [
+    ["North Valley", "Ella Stone", "ella@northtable.com", "+1 604-555-1001", "In Progress", "user-amy", "2026-07-15", "Tax filing support", "VIP client", "1"],
+    ["Coastal Studio", "Mao Li", "mao@coastal.com", "+1 604-555-1002", "Need More Info", "user-ryan", "2026-07-20", "Payroll processing", "Waiting for bank docs", "1"],
+    ["Oakridge Holdings", "Sophie Chen", "sophie@oakridge.com", "+1 604-555-1003", "Reviewed & Billed", "user-amy", "2026-07-22", "Year-end close", "Paid package sent", "1"],
+  ];
+  const escapeCsv = (value) => {
+    const text = String(value ?? "");
+    if (text.includes('"') || text.includes(",") || text.includes("\n")) {
+      return `"${text.replace(/"/g, '""')}"`;
+    }
+    return text;
+  };
+  const lines = [header, ...rows].map((row) => row.map((value) => escapeCsv(value)).join(","));
+  const payload = `${lines.join("\n")}\n`;
+  const blob = new Blob([payload], { type: "text/csv;charset=utf-8" });
+  const anchor = document.createElement("a");
+  const fileName = `heyday-import-template-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.href = URL.createObjectURL(blob);
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  URL.revokeObjectURL(anchor.href);
+  anchor.remove();
+  showToast("Import template downloaded.");
 }
 
 function resetImportState(importedState) {
+  pendingImport = null;
   state = importedState;
   historyStack = [];
+  settingsMode = null;
   currentUserId = MANAGER_ID;
   showCreateClientForm = false;
   createClientDraft = emptyCreateClientDraft();
@@ -2078,7 +3418,7 @@ function resetImportState(importedState) {
     : Object.values(state.clients)[0]?.id || "";
   selectedWorkspaceTab = "profile";
   currentView = "manager";
-  selectedEmployeeDashboardId = "user-amy";
+  selectedEmployeeDashboardId = employees()[0]?.id || MANAGER_ID;
   filters = { query: "", status: "all", employeeId: "all" };
   employeeJobFilter = "all";
   reviewInboxFilter = "all";
@@ -2090,6 +3430,7 @@ function resetImportState(importedState) {
 }
 
 function resetDemo() {
+  settingsMode = null;
   state = resetToSeededState();
   historyStack = [];
   currentUserId = MANAGER_ID;
@@ -2103,7 +3444,7 @@ function resetDemo() {
   editingClientId = null;
   pendingNeedInfoJobId = null;
   pendingReturnJobId = null;
-  selectedEmployeeDashboardId = "user-amy";
+  selectedEmployeeDashboardId = employees()[0]?.id || "user-amy";
   employeeJobFilter = "all";
   previewFileId = null;
   reviewInboxFilter = "all";
@@ -2128,6 +3469,40 @@ function statusOptions(selected) {
 
 function statusPill(status) {
   return `<span class="status-pill ${status}">${escapeHtml(STATUS_LABELS[status] ?? status)}</span>`;
+}
+
+function getWorkspaceTabForStatus(status) {
+  if (status === "new_client" || status === "request_sent") return "request";
+  if (status === "documents_received") return "review";
+  if (status === "job_assigned" || status === "job_accepted" || status === "in_progress" || status === "revision_required" || status === "revision_in_progress") {
+    return "assign";
+  }
+  if (status === "sent_for_review" || status === "resubmitted" || status === "under_review") return "review";
+  if (status === "approved") return "final";
+  if (status === "reviewed_billed" || status === "payment_received") return "billing";
+  if (status === "need_more_info") return "timeline";
+  return "profile";
+}
+
+function statusPillWithAction(status, clientId) {
+  if (!clientId) {
+    return statusPill(status);
+  }
+  return `<button class="status-pill ${status} status-pill-button" data-action="status-open" data-id="${escapeAttr(clientId)}" title="Open in workspace">${escapeHtml(STATUS_LABELS[status] ?? status)}</button>`;
+}
+
+function handleStatusOpen(clientId) {
+  const client = state.clients[clientId];
+  if (!client) {
+    showToast("Client not found.");
+    return;
+  }
+  selectedClientId = clientId;
+  selectedWorkspaceTab = getWorkspaceTabForStatus(client.status);
+  currentView = "manager";
+  showDataToolsMenu = false;
+  settingsMode = null;
+  render();
 }
 
 function actionLockKey(action, targetOrId) {
@@ -2181,7 +3556,7 @@ function info(label, valueText) {
 }
 
 function employees() {
-  return Object.values(state.users).filter((user) => user.role === "employee");
+  return Object.values(state.users).filter(isStaffUser);
 }
 
 function activeEmployeeId() {
@@ -2189,6 +3564,206 @@ function activeEmployeeId() {
     return selectedEmployeeDashboardId;
   }
   return selectedEmployeeDashboardId;
+}
+
+function detectFileExtension(file) {
+  const fromName = String(file?.name || "").toLowerCase();
+  const fromType = String(file?.type || "").toLowerCase();
+
+  if (fromName.endsWith(".xlsx")) return "xlsx";
+  if (fromName.endsWith(".xls")) return "xls";
+  if (fromName.endsWith(".csv")) return "csv";
+  if (fromName.endsWith(".json")) return "json";
+  const lowerType = fromType.toLowerCase();
+  if (lowerType === "text/csv" || lowerType === "application/vnd.ms-excel") return "csv";
+  if (lowerType === "application/json") return "json";
+  if (lowerType.includes("spreadsheetml") || lowerType.includes("sheet") || lowerType.includes("excel")) return "xlsx";
+  return "unknown";
+}
+
+function normalizeFieldAlias(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\uFEFF]/g, "")
+    .replace(/[\s_-]+/g, " ")
+    .replace(/&/g, " and ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseHasClientName(row) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+  const aliases = new Set([
+    "client_name",
+    "client name",
+    "client",
+    "customer",
+    "customer name",
+    "customer_name",
+    "company",
+    "name",
+    "客户",
+    "客户名称",
+    "客户名",
+  ]);
+  return Object.keys(row).some((key) => {
+    const normalized = normalizeFieldAlias(key);
+    if (!aliases.has(normalized)) {
+      if (/\b(client|customer|客户|公司|名字|名称)\b/.test(normalized) && String(row[key] ?? "").trim()) {
+        return true;
+      }
+      return false;
+    }
+    return String(row[key] ?? "").trim() !== "";
+  });
+}
+
+function parseCsvRows(raw) {
+  const text = String(raw ?? "");
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  function pushField() {
+    row.push(field);
+    field = "";
+  }
+
+  function pushRow() {
+    rows.push(row);
+    row = [];
+  }
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const nextChar = text[i + 1];
+    if (inQuotes) {
+      if (char === '"' && nextChar === '"') {
+        field += '"';
+        i += 1;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        field += char;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (char === ",") {
+      pushField();
+      continue;
+    }
+
+    if (char === "\n") {
+      pushField();
+      pushRow();
+      continue;
+    }
+
+    if (char === "\r") {
+      continue;
+    }
+
+    field += char;
+  }
+
+  pushField();
+  if (row.length !== 1 || row[0] !== "") {
+    pushRow();
+  }
+
+  if (!rows.length) {
+    return { rows: [], totalRows: 0, validRows: 0 };
+  }
+
+  const header = rows[0].map((column) => String(column).trim());
+  const hasBOM = header[0]?.charCodeAt(0) === 0xfeff ? header[0].replace(/^\uFEFF/, "") : header[0];
+  if (hasBOM) {
+    header[0] = hasBOM;
+  }
+
+  const records = [];
+  for (let i = 1; i < rows.length; i += 1) {
+    const rowValues = rows[i];
+    if (!rowValues || !rowValues.length) {
+      continue;
+    }
+    const entry = {};
+    let hasValue = false;
+    for (let j = 0; j < header.length; j += 1) {
+      const key = header[j];
+      const value = rowValues[j] ?? "";
+      entry[key] = value;
+      if (!hasValue && String(value).trim()) {
+        hasValue = true;
+      }
+    }
+    if (!hasValue) {
+      continue;
+    }
+    records.push(entry);
+  }
+  const totalRows = Math.max(0, rows.length - 1);
+  const validRows = records.filter(parseHasClientName).length;
+  return { rows: records, totalRows, validRows };
+}
+
+async function loadSheetJsParser() {
+  if (window.XLSX && typeof window.XLSX.read === "function" && window.XLSX.utils?.sheet_to_json) {
+    return window.XLSX;
+  }
+
+  if (!document) {
+    throw new Error("SheetJS parser is unavailable in this environment.");
+  }
+
+  if (!loadSheetJsParser.promise) {
+    loadSheetJsParser.promise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.id = "sheetjs-cdn";
+      script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+      script.async = true;
+      script.onload = () => resolve(window.XLSX);
+      script.onerror = () => reject(new Error("Unable to load Excel parser library. Please check your network connection."));
+      document.body.appendChild(script);
+    });
+  }
+
+  const lib = await loadSheetJsParser.promise;
+  if (!lib?.read) {
+    throw new Error("Loaded SheetJS library is not available.");
+  }
+  return lib;
+}
+
+function parseXlsxRows(buffer) {
+  return loadSheetJsParser()
+    .then((XLSX) => {
+      const workbook = XLSX.read(buffer, { type: "array" });
+      const firstSheetName = workbook?.SheetNames?.[0];
+      if (!firstSheetName) {
+        throw new Error("No worksheet found in the Excel file.");
+      }
+      const sheet = workbook.Sheets[firstSheetName];
+      if (!sheet || !sheet["!ref"]) {
+        throw new Error("The first worksheet is empty.");
+      }
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+      if (!Array.isArray(rows) || rows.length === 0) {
+        throw new Error("The first worksheet is empty.");
+      }
+      const validRows = rows.filter(parseHasClientName).length;
+      return { rows, totalRows: rows.length, validRows };
+    });
 }
 
 function getActiveMissingInfoRequest(clientId) {

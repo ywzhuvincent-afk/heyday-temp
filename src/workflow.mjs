@@ -1271,7 +1271,8 @@ function requireManager(state, userId) {
 
 function requireEmployee(state, userId) {
   const user = requireUser(state, userId);
-  if (user.role !== "employee") {
+  const role = String(user.role || "").trim().toLowerCase();
+  if (role && !["employee", "staff", "member"].includes(role)) {
     throw new Error("Employee access required");
   }
   return user;
@@ -1401,8 +1402,36 @@ function nextRecordId(prefix, records) {
   return `${prefix}-${nextNumber}`;
 }
 
+function generateTokenSuffix(length = 8) {
+  if (typeof globalThis.crypto === "object" && typeof globalThis.crypto.getRandomValues === "function") {
+    const values = new Uint8Array(Math.max(6, Math.floor(length)));
+    globalThis.crypto.getRandomValues(values);
+    return [...values]
+      .map((value) => value.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, length * 2);
+  }
+
+  const randomSeed = `${Date.now()}-${Math.random()}-${now}-${sequence}-${clientId}`;
+  let hash = 2166136261;
+  for (let i = 0; i < randomSeed.length; i += 1) {
+    hash ^= randomSeed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  const fallback = hash.toString(16).padStart(8, "0");
+  const mixed = randomSeed
+    .split("")
+    .reverse()
+    .join("")
+    .replace(/\D/g, "")
+    .slice(0, 8)
+    .padStart(8, "f");
+  return `${fallback}${mixed}`;
+}
+
 function makeToken(clientId, now, sequence) {
-  return Array.from(`${clientId}:${now}:${sequence}`)
-    .map((char) => char.codePointAt(0).toString(36).padStart(2, "0"))
-    .join("");
+  const safeClient = String(clientId || "client").replace(/[^a-zA-Z0-9_-]/g, "");
+  const safeNow = Number.isFinite(Date.parse(now)) ? Date.parse(now) : Date.now();
+  const safeSequence = Math.max(1, Number(sequence) || 1);
+  return `${safeClient}-${safeNow}-${safeSequence}-${generateTokenSuffix(6)}`;
 }

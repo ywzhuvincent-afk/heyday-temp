@@ -156,6 +156,92 @@ describe("client data store", () => {
     assert.match(fromObject.error ?? "", /missing client.*job records/i);
   });
 
+  it("imports spreadsheet rows (CSV/XLSX parsed objects) as full client/job data", () => {
+    const spreadsheetRows = [
+      {
+        "client_name": "North Valley Builders",
+        "contact_name": "Ella Stone",
+        "email": "ella@northvalley.ca",
+        "phone": "(604) 555-0109",
+        "status": "In Progress",
+        "assigned_to": "Amy Wong",
+        "due_date": "2026-07-01",
+        "job_title": "Year-end tax return",
+        "review_round": "2",
+      },
+      {
+        "client_name": "Coastal Studio",
+        "contact_name": "Mao Lee",
+        "email": "mao@coastalstudio.ca",
+        "status": "Need More Info",
+      },
+    ];
+
+    const result = importClientData(spreadsheetRows);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.summary.clients, 2);
+    assert.equal(result.summary.jobs, 2);
+    const [firstClient, secondClient] = Object.values(result.state.clients);
+    const [firstJob, secondJob] = Object.values(result.state.jobs);
+    assert.equal(firstClient.status, "in_progress");
+    assert.equal(firstClient.status, firstJob.status);
+    assert.equal(firstJob.reviewRound, 2);
+    assert.equal(secondClient.status, "need_more_info");
+  });
+
+  it("imports legacy wrapper payloads with state/data keys", () => {
+    const base = createInitialState();
+    const payload = {
+      state: {
+        clients: {
+          "client-wrapper": {
+            ...base.clients["client-1"],
+            id: "client-wrapper",
+            name: "Wrapped Customer",
+          },
+        },
+        jobs: {
+          "job-wrapper": {
+            ...base.jobs["job-1"],
+            id: "job-wrapper",
+            clientId: "client-wrapper",
+          },
+        },
+      },
+    };
+
+    const wrappedStateResult = importClientData(payload);
+    assert.equal(wrappedStateResult.ok, true);
+    assert.equal(wrappedStateResult.state.clients["client-wrapper"].name, "Wrapped Customer");
+    assert.equal(wrappedStateResult.state.jobs["job-wrapper"].clientId, "client-wrapper");
+
+    const dataWrappedResult = importClientData({ data: payload.state });
+    assert.equal(dataWrappedResult.ok, true);
+    assert.equal(dataWrappedResult.state.clients["client-wrapper"].name, "Wrapped Customer");
+    assert.equal(dataWrappedResult.state.jobs["job-wrapper"].clientId, "client-wrapper");
+  });
+
+  it("returns explicit error for empty spreadsheet rows", () => {
+    const result = importClientData([]);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "No valid client rows in spreadsheet");
+    assert.equal(result.meta?.totalRows, 0);
+    assert.equal(result.meta?.validRows, 0);
+  });
+
+  it("returns explicit error for spreadsheet with no client name column values", () => {
+    const result = importClientData([
+      { foo: "bar", status: "In Progress" },
+      { client: "", notes: "missing customer name" },
+    ]);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "No valid client rows in spreadsheet");
+    assert.equal(result.meta?.totalRows, 2);
+    assert.equal(result.meta?.validRows, 0);
+  });
+
   it("exports versioned backup JSON that can be imported back", () => {
     const storage = createMockStorage();
     const seeded = withStorage(storage, () => resetToSeededState());
